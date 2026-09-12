@@ -1,252 +1,278 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { currentUser } from '@/lib/auth';
-import {
-  getSettings, getReadiness, recentReadiness, recentKnee, getKnee,
-  allJobs, getSlots,
-} from '@/lib/db';
-import { brief } from '@/lib/coach';
-import { toIso, fmtLong, fmt } from '@/lib/plan';
-import { targets } from '@/lib/fuel';
-import { KNEE10 } from '@/lib/knee';
-import { fmtMinutes } from '@/lib/work';
-import { LEFT_FIRST_RULE } from '@/lib/gym';
+import { getSettings, getReadiness, recentReadiness, sessionsOn } from '@/lib/db';
+import { assess } from '@/lib/readiness';
+import { adapt } from '@/lib/adapt';
+import { weekPlan, weekFor, blockFor, GATES, DELOADS, labelFor } from '@/lib/plan';
+import { statusLine } from '@/lib/coach';
+import { dayNutrition } from '@/lib/nutrition/server';
 import Nav from './_components/Nav';
-import Mast from './_components/Mast';
-import CheckIn from './_components/CheckIn';
+import ReadinessForm from './_components/ReadinessForm';
 
 export const dynamic = 'force-dynamic';
 
-export default async function Today() {
-  if (!(await currentUser())) redirect('/login');
+const DISC_NAME: Record<string, string> = {
+  SW: 'Swim', BK: 'Bike', RN: 'Run', ST: 'Strength', OT: 'Other',
+};
 
-  const day = toIso(new Date());
-  const [settings, today, history, kneeLogs, kneeToday, jobs, slots] = await Promise.all([
-    getSettings(), getReadiness(day), recentReadiness(day, 30), recentKnee(day, 40),
-    getKnee(day), allJobs(), getSlots(),
+export default async function Today({
+  searchParams,
+}: {
+  searchParams: Promise<{ logged?: string; day?: string; edit?: string }>;
+}) {
+  if (!(await currentUser())) redirect('/login');
+  const params = await searchParams;
+
+  const s = await getSettings();
+  const day = params.day ?? new Date().toISOString().slice(0, 10);
+
+  const [readiness, history, logged] = await Promise.all([
+    getReadiness(day),
+    recentReadiness(day, 22),
+    sessionsOn(day),
   ]);
 
-  const b = brief(day, { today, history, kneeLogs, jobs, slots });
-  const { ctx } = b;
-  const fuel = targets(settings.weight_kg, day);
-  const weightGap = Math.round((settings.weight_kg - ctx.targetWeight) * 10) / 10;
-  const sesh = b.session;
+  const week = weekFor(s.start_date, day);
+  const started = week >= 1 && week <= 45;
+  const block = blockFor(Math.min(45, Math.max(1, week)));
+
+  const verdict = readiness
+    ? assess(readiness, history.filter((r) => r.day !== day))
+    : null;
+
+  const days = started ? weekPlan(week, s) : weekPlan(1, s);
+  const dow = ((new Date(day + 'T12:00:00Z').getUTCDay() + 6) % 7) + 1;
+  const todayPlan = days.find((d) => d.date === day) ?? days[dow - 1];
+  const planned = started ? todayPlan?.sessions ?? [] : [];
+
+  const a = adapt(planned, verdict);
+  const raceDate = new Date(s.race_date + 'T12:00:00Z');
+  const daysToRace = Math.max(0, Math.ceil((raceDate.getTime() - Date.now()) / 86_400_000));
+  const gate = GATES[week];
+
+  const loggedKeys = new Set(logged.map((l) => l.plan_key).filter(Boolean));
+
+  // The nutrition engine reads the same plan and the same log this page does,
+  // so what it says here can never disagree with the sessions listed below.
+  const fuel = await dayNutrition(day);
+  const nextFuel = fuel.plan.entries.find((e) => e.kind === 'during') ?? null;
 
   return (
-    <div className="wrap">
-      <Mast ctx={ctx} title={fmtLong(day)} />
-
-      {/* --------------------------------------------------- the verdict */}
-      <div className={`verdict ${b.band}`}>
-        <h2>{b.headline}</h2>
-        <p>{b.sub}</p>
-        {b.readiness && (
-          <p className="xs" style={{ marginTop: 8 }}>
-            Readiness {b.readiness.score} · {ctx.block.name} · {ctx.plan.headline}
-          </p>
-        )}
-      </div>
-
-      {b.readiness?.drivers.length ? (
-        <div className="note neutral">
-          {b.readiness.drivers.map((d, i) => (
-            <p key={i} style={{ margin: i ? '6px 0 0' : 0 }}>{d}</p>
-          ))}
-        </div>
-      ) : null}
-
-      {/* --------------------------------------------------------- work */}
-      <div className="card">
-        <h2>What work to do</h2>
-        <p className="desc">{b.next.line}</p>
-
-        {b.next.alsoChase && (
-          <div className="note" style={{ marginBottom: 12 }}>
-            <b>Chase first, it costs two minutes.</b>{' '}
-            {b.next.alsoChase.job.title} has been sitting on {b.next.alsoChase.job.waiting_on} for{' '}
-            {b.next.alsoChase.waitingDays} day{b.next.alsoChase.waitingDays === 1 ? '' : 's'}. Nothing moves until they move.
-          </div>
-        )}
-
-        {b.q.doNow.slice(0, 4).map((s, i) => (
-          <div key={s.job.id} className="sesh">
-            <div className="sesh-h">
-              <span className="slot">{i + 1}</span>
-              <span className={`disc d-${s.job.kind}`}>{s.job.kind}</span>
-              <b>{s.job.title}</b>
-              {s.job.client && <span className="xs">{s.job.client}</span>}
-              {s.atRisk && <span className="chip red">Will not fit</span>}
-              {s.job.dread && <span className="chip amber">Avoided</span>}
-              <span className="mins">{fmtMinutes(s.remaining)}</span>
+    <>
+      <div className="wrap">
+        <header className="mast">
+          <div>
+            <h1>{labelFor(day)}</h1>
+            <div className="xs">
+              {started
+                ? `Week ${week} of 45 · Block ${block.n} — ${block.name}`
+                : week < 1
+                  ? `Programme starts ${labelFor(s.start_date)}`
+                  : 'Programme complete'}
             </div>
-            <div className="sesh-b">
-              {s.reason}
-              {s.job.due && (
-                <div className="xs" style={{ marginTop: 4 }}>
-                  Due {fmt(s.job.due)}
-                  {s.capacityToDue !== null && ` · ${fmtMinutes(s.capacityToDue)} of slot before then`}
-                </div>
+          </div>
+          <div className="right">
+            <div>
+              <div className="lab">To go</div>
+              <div className="v">{daysToRace}d</div>
+            </div>
+          </div>
+        </header>
+
+        {params.logged && <p className="ok small" style={{ marginBottom: 12 }}>Session logged.</p>}
+
+        {(!readiness || params.edit) ? (
+          <div className="card">
+            <h2>{readiness ? 'Edit today\u2019s check-in' : 'Morning check-in'}</h2>
+            <p className="desc">
+              Sixty seconds. Answer the scores fast and the same careless way every day — a
+              consistent gut answer is worth far more than a considered one, because only the
+              trend matters.
+            </p>
+            <ReadinessForm day={day} lastWeight={Number(s.weight_kg)} />
+          </div>
+        ) : (
+          <>
+            <div className={`verdict ${verdict!.band}`}>
+              <h2>
+                {a.headline}{' '}
+                <span className={`chip ${verdict!.band}`} style={{ verticalAlign: 'middle' }}>
+                  {verdict!.band} · {verdict!.score}
+                </span>
+              </h2>
+              <p>{a.rationale}</p>
+              {verdict!.reasons.length > 0 && (
+                <ul className="small muted" style={{ margin: '10px 0 0', paddingLeft: 18 }}>
+                  {verdict!.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                </ul>
               )}
             </div>
-          </div>
-        ))}
 
-        <div className={`note ${b.work.band === 'green' ? 'neutral' : ''}`} style={{ marginTop: 12, marginBottom: 0 }}>
-          <b>{b.work.headline}.</b> {b.work.detail}
-        </div>
-
-        <p style={{ marginTop: 12, marginBottom: 0 }}>
-          <Link href="/work" className="btn ghost wide">Open the work list</Link>
-        </p>
-      </div>
-
-      {/* ------------------------------------------------------ training */}
-      {sesh ? (
-        <div className="card">
-          <h2>
-            Day {sesh.day.n} — {sesh.replaces ? sesh.replaces.title : sesh.day.title}
-          </h2>
-          <p className="desc">
-            {sesh.day.time} · {sesh.replaces ? '25' : sesh.day.minutes} min ·{' '}
-            {sesh.replaces ? 'Race week — no fatigue' : sesh.day.subtitle}
-            {!sesh.replaces && <> · compounds at <b>{sesh.compounds}</b></>}
-          </p>
-
-          {sesh.notes.map((n, i) => (
-            <div key={i} className="note" style={{ marginBottom: 10 }}>{n}</div>
-          ))}
-
-          {sesh.day.warmup && (
-            <div className="note neutral"><b>Warm-up.</b> {sesh.day.warmup}</div>
-          )}
-
-          {sesh.plyo.length === 0 && sesh.day.key === 'lowerB' && b.rung.suspended && (
-            <div className="note" style={{ marginBottom: 10 }}>
-              <b>No plyometrics today.</b> {b.rung.reason}
-            </div>
-          )}
-
-          {sesh.plyo.length > 0 && (
-            <div className="sesh">
-              <div className="sesh-h">
-                <span className={`disc d-plyo`}>Plyo</span>
-                <b>Rung {b.rung.rung} — {b.rung.spec.name}</b>
-                <span className="mins">{ctx.monthsPostOp.toFixed(1)} mo</span>
+            {gate && (
+              <div className="note">
+                <b>{gate.title}</b> — {gate.test}
               </div>
-              <div className="sesh-b">
-                <ul style={{ margin: '0 0 6px', paddingLeft: 18 }}>
-                  {sesh.plyo.map((p) => <li key={p}>{p}</li>)}
-                </ul>
-                <div className="why">{b.rung.reason}</div>
+            )}
+            {DELOADS.has(week) && !gate && (
+              <div className="note neutral">
+                <b>Recovery week.</b> Around 62% of normal volume. Intensity is kept, tonnage is
+                not — and this is where the adaptation actually lands. Do not top it up because
+                you feel good.
               </div>
-            </div>
-          )}
+            )}
 
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr><th>Exercise</th><th style={{ width: 92 }}>Sets</th></tr>
-              </thead>
-              <tbody>
-                {(sesh.replaces ? sesh.replaces.exercises : sesh.day.exercises.filter((e) => !e.plyo)).map((e) => (
-                  <tr key={e.name}>
-                    <td className="k">
-                      {e.name}
-                      {e.left && <span className="chip key" style={{ marginLeft: 6 }}>Left first</span>}
-                      {e.note && <div className="xs" style={{ fontWeight: 400, marginTop: 2 }}>{e.note}</div>}
-                    </td>
-                    <td className="mono">
-                      {e.compound && !sesh.replaces ? sesh.compounds.split(',')[0] : e.sets}
-                      {e.iso && sesh.isolationScale < 1 && (
-                        <div className="xs">−{Math.round((1 - sesh.isolationScale) * 100)}%</div>
+            <h2 style={{ marginBottom: 8 }}>Today</h2>
+
+            {!started && week < 1 && (
+              <div className="card">
+                <p>
+                  <b>Training starts {labelFor(s.start_date)}.</b> Until then the check-in is the
+                  only thing that matters — every morning you log now builds the baseline the
+                  readiness engine scores against, and it needs about a fortnight of data before
+                  it can tell a bad night from a real problem.
+                </p>
+                <p className="small muted" style={{ marginBottom: 0 }}>
+                  Worth sorting before week 1: a smart trainer (the single highest-return purchase
+                  in this whole plan — the bike is the limiter and without power it is guesswork),
+                  a heart-rate strap, pool access that works at 05:45, and running shoes with life
+                  in them. Then check your details in Settings.
+                </p>
+              </div>
+            )}
+
+            {started && a.sessions.length === 0 && (
+              <div className="card"><p style={{ margin: 0 }} className="muted">
+                Nothing scheduled. Rest is a session — take it.
+              </p></div>
+            )}
+
+            {a.sessions.map((sess) => {
+              const done = loggedKeys.has(sess.key);
+              const cancelled = sess.minutes === 0 && sess.disc !== 'OT';
+              return (
+                <div key={sess.key} className={`sesh${done ? ' done' : ''}${cancelled ? ' cancelled' : ''}`}>
+                  <div className="sesh-h">
+                    <span className="slot">{sess.slot}</span>
+                    <span className={`disc d-${sess.disc}`}>{DISC_NAME[sess.disc]}</span>
+                    <b>{sess.title}</b>
+                    {sess.keySession && !cancelled && <span className="chip key">Key</span>}
+                    {done && <span className="chip plain">Logged</span>}
+                    <span className="mins num">
+                      {sess.originalMinutes && sess.originalMinutes !== sess.minutes && (
+                        <s>{sess.originalMinutes}</s>
                       )}
-                    </td>
-                  </tr>
+                      {cancelled ? '—' : `${sess.minutes} min`}
+                    </span>
+                  </div>
+                  <div className="sesh-b">
+                    {sess.detail}
+                    {sess.because && <div className="why">↳ {sess.because}</div>}
+                    {!done && !cancelled && sess.disc !== 'OT' && (
+                      <div style={{ marginTop: 12 }}>
+                        <Link
+                          className="btn ghost small"
+                          href={`/log?d=${sess.disc}&key=${encodeURIComponent(sess.key)}&t=${encodeURIComponent(sess.title)}&m=${sess.minutes}&day=${day}`}
+                        >
+                          Log this
+                        </Link>
+                      </div>
+                    )}
+                    {!done && sess.disc === 'OT' && sess.minutes > 0 && (
+                      <div style={{ marginTop: 12 }}>
+                        <Link className="btn ghost small" href={`/log?d=OT&t=${encodeURIComponent(sess.title)}&m=${sess.minutes}&day=${day}`}>
+                          Log this
+                        </Link>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+
+            {logged.length > 0 && (
+              <>
+                <h2 style={{ margin: '20px 0 8px' }}>Logged today</h2>
+                <div className="card" style={{ padding: 0 }}>
+                  <div className="scroll">
+                    <table>
+                      <thead>
+                        <tr><th style={{ paddingLeft: 12 }}>Session</th><th>Dur</th><th>RPE</th><th>Notes</th></tr>
+                      </thead>
+                      <tbody>
+                        {logged.map((l) => (
+                          <tr key={l.id}>
+                            <td className="k" style={{ paddingLeft: 12 }}>
+                              {DISC_NAME[l.discipline] ?? l.discipline} — {l.title ?? '—'}
+                            </td>
+                            <td>{l.duration_min ?? '—'}</td>
+                            <td>{l.rpe ?? '—'}</td>
+                            <td className="muted small">{l.notes ?? l.niggle ?? ''}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {/* ------------------------------------------------------ fuel */}
+            <h2 style={{ margin: '20px 0 8px' }}>Fuel today</h2>
+            <div className="fuelstrip">
+              <div className="b acc">
+                <div className="v acc">{fuel.targets.kcal.toLocaleString()}</div>
+                <div className="n">kcal</div>
+              </div>
+              <div className="b">
+                <div className="v">{fuel.targets.carb} g</div>
+                <div className="n">carbs · {fuel.targets.carbPerKg} g/kg</div>
+              </div>
+              <div className="b">
+                <div className="v">{fuel.targets.protein} g</div>
+                <div className="n">protein</div>
+              </div>
+              <div className="b">
+                <div className="v">{(fuel.targets.fluidMl / 1000).toFixed(1)} L</div>
+                <div className="n">fluid</div>
+              </div>
+            </div>
+
+            {nextFuel && (
+              <div className="note">
+                <b>On the bike or on the run today.</b> {nextFuel.note}
+              </div>
+            )}
+
+            <div className="card">
+              {fuel.plan.entries
+                .filter((e) => e.kind === 'breakfast' || e.kind === 'lunch' || e.kind === 'dinner')
+                .map((e) => (
+                  <div key={e.seq} style={{ display: 'flex', gap: 12, padding: '7px 0', borderBottom: '1px solid var(--rule-2)' }}>
+                    <span className="mono xs" style={{ width: 46, flexShrink: 0, paddingTop: 2 }}>{e.at}</span>
+                    <span style={{ flex: 1 }}>
+                      <b style={{ fontSize: 14 }}>{e.title}</b>
+                      <div className="xs">{e.items.map((it) => `${it.name} ${it.display}`).join(' · ')}</div>
+                    </span>
+                    <span className="num xs" style={{ flexShrink: 0 }}>{e.kcal}</span>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              <p style={{ margin: '12px 0 0' }}>
+                <Link className="btn ghost small" href="/fuel">The whole day, and the training fuel</Link>
+              </p>
+            </div>
 
-          <div className="note" style={{ marginTop: 12, marginBottom: 0 }}>
-            <b>The rule.</b> {LEFT_FIRST_RULE}
-          </div>
-
-          {!sesh.replaces && sesh.day.tail && <p className="small muted" style={{ marginTop: 10, marginBottom: 0 }}>{sesh.day.tail}</p>}
-        </div>
-      ) : (
-        <div className="card">
-          <h2>No lift today</h2>
-          <p className="desc" style={{ marginBottom: 0 }}>{ctx.plan.headline}. That is the plan, not a gap in it.</p>
-        </div>
-      )}
-
-      {/* ---------------------------------------------------- the day */}
-      <div className="card">
-        <h2>{ctx.plan.name}</h2>
-        <p className="desc">{ctx.plan.headline}</p>
-        {ctx.plan.slots.map((s) => (
-          <div key={s.time + s.label} style={{ display: 'flex', gap: 12, padding: '8px 0', borderBottom: '1px solid var(--rule-2)' }}>
-            <span className="mono xs" style={{ width: 46, flexShrink: 0, paddingTop: 2 }}>{s.time}</span>
-            <span style={{ flex: 1 }}>
-              <b style={{ fontSize: 14 }}>{s.label}</b>
-              {s.detail && <div className="xs" style={{ marginTop: 2 }}>{s.detail}</div>}
-            </span>
-          </div>
-        ))}
+            <p className="xs" style={{ marginTop: 18 }}>{statusLine(s)}</p>
+            <p className="xs">
+              <Link href={`/?day=${day}&edit=1`} style={{ textDecoration: 'underline' }}>
+                Change today&rsquo;s check-in
+              </Link>{' '}
+              if you got a number wrong — it overwrites, it does not add a second one.
+            </p>
+          </>
+        )}
       </div>
-
-      {/* --------------------------------------------------------- knee */}
-      <div className="card">
-        <h2>The left leg</h2>
-        <p className="desc">
-          {ctx.monthsPostOp.toFixed(1)} months post-op · Rung {b.rung.rung} — {b.rung.spec.name}
-          {b.rung.suspended
-            ? ` · block suspended until ${b.rung.demotedUntil}`
-            : b.rung.demoted
-              ? ` · held down until ${b.rung.demotedUntil}`
-              : ''}
-        </p>
-        <div className={`verdict ${b.knee.band}`} style={{ marginBottom: 12 }}>
-          <h2 style={{ fontSize: 15 }}>{b.knee.line}</h2>
-          {b.knee.detail && <p>{b.knee.detail}</p>}
-        </div>
-        <div className="kpis">
-          <div className="kpi">
-            <div className="v">{kneeToday?.knee10 ? 'Done' : 'Not yet'}</div>
-            <div className="n">Knee 10 — {KNEE10.length} movements, ten minutes, non-negotiable</div>
-          </div>
-          <div className="kpi acc">
-            <div className="v acc">{kneeToday?.swelling === null || kneeToday === null ? '—' : ['Zero', 'Trace', '1+', '2+'][kneeToday.swelling ?? 0]}</div>
-            <div className="n">Last swelling grade</div>
-          </div>
-        </div>
-        <Link href="/knee" className="btn ghost wide">Knee page — log it</Link>
-      </div>
-
-      {/* --------------------------------------------------------- fuel */}
-      <div className="card">
-        <h2>Fuel today</h2>
-        <p className="desc">
-          {fuel.training ? 'Training day' : 'Light day'} at {settings.weight_kg.toFixed(1)} kg · target for today&rsquo;s
-          date is {ctx.targetWeight.toFixed(1)} kg
-          {weightGap >= 0 ? ` — you are ${weightGap.toFixed(1)} kg ahead` : ` — you are ${Math.abs(weightGap).toFixed(1)} kg behind`}
-        </p>
-        <div className="kpis" style={{ marginBottom: 0 }}>
-          <div className="kpi acc"><div className="v acc">{fuel.kcal.toLocaleString()}</div><div className="n">kcal</div></div>
-          <div className="kpi"><div className="v">{fuel.protein} g</div><div className="n">protein</div></div>
-          <div className="kpi"><div className="v">{fuel.carbs} g</div><div className="n">carbs</div></div>
-          <div className="kpi"><div className="v">{fuel.fat} g</div><div className="n">fat</div></div>
-        </div>
-      </div>
-
-      {/* ----------------------------------------------------- check-in */}
-      <CheckIn day={day} existing={today} />
-
-      <p className="xs" style={{ textAlign: 'center' }}>
-        {ctx.block.name} · block {ctx.block.n} of 9 · {ctx.nextEvent ? `${ctx.nextEvent.name} in ${ctx.daysToNext} days` : 'no events scheduled'}
-      </p>
-
       <Nav active="/" />
-    </div>
+    </>
   );
 }
