@@ -2,7 +2,7 @@ import { cookies } from 'next/headers';
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { sql } from './db';
 
-const COOKIE = 'sub10_session';
+const COOKIE = 'g2g_session';
 const MAX_AGE = 60 * 60 * 24 * 120; // 120 days — he should not be logging in every week
 
 function secret(): string {

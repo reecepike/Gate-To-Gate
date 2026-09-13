@@ -1,470 +1,249 @@
-import type { Settings } from './db';
-import { ms } from './project';
-import { poolLength, withLengths } from './pool';
-
 /**
- * The 45-week plan generator.
+ * The calendar spine: blocks, races, the post-op clock and the bodyweight ramp.
  *
- * The roadmap states intent; this turns it into dated, numbered sessions.
- * Prescriptions use the athlete's real tested numbers wherever they exist and
- * fall back to descriptive targets where they do not — which is more accurate
- * than zones derived from a guess.
+ * Everything else in the app reads its context from here, so that a date only
+ * ever has to be interpreted once. Dates are calendar days ('YYYY-MM-DD'),
+ * never instants — a timezone is exactly the thing that puts Wednesday's gates
+ * session on a Tuesday.
  */
 
-export type Slot = 'AM' | 'PM' | 'EVE' | 'ALL';
-export type Disc = 'SW' | 'BK' | 'RN' | 'ST' | 'OT';
+export const SURGERY = '2025-09-04';   // ACL reconstruction + meniscus repair + LET
+export const CHAMPS = '2027-07-24';    // British Championships, date provisional
+export const PROG_START = '2026-08-31'; // Monday of programme week 1
 
-export type PlannedSession = {
-  key: string;
-  slot: Slot;
-  disc: Disc;
-  title: string;
-  detail: string;
-  minutes: number;
-  keySession: boolean;      // carries the block's primary stimulus
-  keyIntensity: boolean;    // the two that must never sit on consecutive days
-};
+/* --------------------------------------------------------------- dates */
 
-export type PlannedDay = {
-  date: string;             // ISO
-  dow: number;              // 1 = Monday
-  label: string;            // "Mon 14 Sep"
-  sessions: PlannedSession[];
-  note?: string;
-};
+export function toIso(d: Date | string): string {
+  if (typeof d === 'string') return d.slice(0, 10);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Parse a calendar day into a local-noon Date — noon so DST can never shift it. */
+export function fromIso(iso: string): Date {
+  const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1, 12, 0, 0, 0);
+}
+
+export function addDays(iso: string, n: number): string {
+  const d = fromIso(iso);
+  d.setDate(d.getDate() + n);
+  return toIso(d);
+}
+
+export function daysBetween(from: string, to: string): number {
+  return Math.round((fromIso(to).getTime() - fromIso(from).getTime()) / 86400000);
+}
+
+/** 1 = Monday … 7 = Sunday. */
+export function dow(iso: string): number {
+  const d = fromIso(iso).getDay();
+  return d === 0 ? 7 : d;
+}
+
+export function mondayOf(iso: string): string {
+  return addDays(iso, 1 - dow(iso));
+}
+
+export function fmt(iso: string, opts: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'short' }): string {
+  return fromIso(iso).toLocaleDateString('en-GB', opts);
+}
+
+export function fmtLong(iso: string): string {
+  return fromIso(iso).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+/** Programme week number, 1-based. Week 1 is the week of PROG_START. */
+export function weekFor(iso: string): number {
+  return Math.floor(daysBetween(PROG_START, mondayOf(iso)) / 7) + 1;
+}
+
+export function weekStart(week: number): string {
+  return addDays(PROG_START, (week - 1) * 7);
+}
+
+/* -------------------------------------------------------------- blocks */
 
 export type Block = {
   n: number;
   name: string;
-  from: number;
-  to: number;
-  tpl: TemplateKey;
-  focus: string;
+  short: string;
+  from: string;
+  to: string;
+  weeks: number;
+  brief: string;
+  targets: string[];
+  /** Lifting days per week in this block. */
+  gymDays: number;
+  /** How the compound lifts are prescribed here. */
+  compounds: string;
+  /** What happens to the isolation / physique work. */
+  isolation: string;
+  /** The highest plyometric rung this block permits. */
+  rung: 1 | 2 | 3 | 4;
 };
-
-type TemplateKey = 'found' | 'base1' | 'base2' | 'build1' | 'build2' | 'bolton' | 'peak' | 'taper';
 
 export const BLOCKS: Block[] = [
-  { n: 0, name: 'Foundation & Assessment', from: 1, to: 4, tpl: 'found',
-    focus: 'Measure everything. Establish the habit before the load.' },
-  { n: 1, name: 'Base 1 — Aerobic & Technique', from: 5, to: 12, tpl: 'base1',
-    focus: 'Aerobic development at Z2 with the swim rebuilt from the stroke up.' },
-  { n: 2, name: 'Base 2 — Volume & Bike Bias', from: 13, to: 20, tpl: 'base2',
-    focus: 'The largest aerobic block. The bike takes roughly half the hours.' },
-  { n: 3, name: 'Build 1 — Threshold', from: 21, to: 28, tpl: 'build1',
-    focus: 'Intensity arrives properly. Bricks become weekly.' },
-  { n: 4, name: 'Build 2 — Race Specific', from: 29, to: 36, tpl: 'build2',
-    focus: 'Everything becomes Leeds-shaped. Repeated climbing under fatigue.' },
-  { n: 5, name: 'Sharpen & 70.3 Bolton', from: 37, to: 38, tpl: 'bolton',
-    focus: 'A genuine taper into a genuine race. Bolton is the dress rehearsal.' },
-  { n: 6, name: 'IM Specific & Peak', from: 39, to: 43, tpl: 'peak',
-    focus: 'The biggest weeks. A 5 h ride at race power, then run off it.' },
-  { n: 7, name: 'Taper & Race', from: 44, to: 45, tpl: 'taper',
-    focus: 'Volume falls, intensity is retained but shortened. Nothing new.' },
+  {
+    n: 1, name: 'Race Cluster', short: 'Races', from: '2026-08-31', to: '2026-09-27', weeks: 4, gymDays: 4,
+    compounds: '3×5 @ ~75%, never to failure', isolation: 'Full volume — it costs you nothing on race day. Drop Day 5 in race weeks.', rung: 1,
+    brief:
+      'Three race weekends in four weeks, so there is nothing to build here. Gym drops to maintenance: keep the movements, lose the fatigue, arrive at every Saturday without a trace of soreness. Use the races as diagnostics — where does the left leg go quiet, and where does confidence run out?',
+    targets: ['Hold 70 kg', 'Baseline test done', 'Plyo Rung 1', 'Landing quality over height'],
+  },
+  {
+    n: 2, name: 'Foundation & Mass', short: 'Foundation', from: '2026-09-28', to: '2026-11-08', weeks: 6, gymDays: 5,
+    compounds: '4×8 @ ~70%, 3 s lowering', isolation: 'Peak. Highest volume of the year, top of every rep range. This is the mass block.', rung: 1,
+    brief:
+      'The real start. Highest training volume of the year and the point where the surplus opens up. Reps in the 8–10 range build the tissue that everything later gets to express. Expect the early kilos to come quickly — you are reclaiming what the injury took, not building from nothing.',
+    targets: ['72.5 kg by 8 Nov', '4×8 @ 70%', 'Plyo Rung 1', 'LSI > 90%'],
+  },
+  {
+    n: 3, name: 'Strength I', short: 'Strength I', from: '2026-11-09', to: '2026-12-20', weeks: 6, gymDays: 5,
+    compounds: '4×5 @ ~80%', isolation: 'Held at full volume. Compounds get heavier; isolation stays where it is.', rung: 2,
+    brief:
+      'Implode sits in week one, so that week is a mini-taper and the block proper starts on the 16th. Then load goes up and reps come down. You will feel heavy and slightly slow through this block. That is correct and it is temporary.',
+    targets: ['74 kg by 20 Dec', '4×5 @ 80%', 'Plyo Rung 2', 'LSI > 95%'],
+  },
+  {
+    n: 4, name: 'Strength II', short: 'Strength II', from: '2026-12-21', to: '2027-01-31', weeks: 6, gymDays: 5,
+    compounds: '5×3 @ ~87%, maximal intent', isolation: 'Held. Heaviest compounds of the year, same delt and arm work.', rung: 3,
+    brief:
+      'The heaviest block of the year, with Christmas inside it. Hold the line over the festive fortnight rather than writing it off and making it up in January. Reactive work steps to Rung 3 — this is where the leg starts behaving like a racer’s again.',
+    targets: ['75.5 kg by 31 Jan', '5×3 @ 87%', 'Plyo Rung 3', 'LSI > 96%'],
+  },
+  {
+    n: 5, name: 'Winter Engine', short: 'Engine', from: '2027-02-01', to: '2027-03-14', weeks: 6, gymDays: 4,
+    compounds: '3×5 @ ~78%, maintenance', isolation: 'Reduced ~30%. Aerobic work is the priority; Day 3 merges into the run week.', rung: 3,
+    brief:
+      'The quietest stretch of the racing year, so it is the only sensible place to chase the 5 k and the swim. Strength holds at maintenance while aerobic work steps up to three sessions a week. Ends on 13 March with the full benchmark battery — your original ‘race fit’ date, now a checkpoint you can measure rather than a finish line.',
+    targets: ['77 kg by 14 Mar', '5 k time trial', 'Strength maintained', 'March benchmark day'],
+  },
+  {
+    n: 6, name: 'Power Conversion', short: 'Conversion', from: '2027-03-15', to: '2027-04-25', weeks: 6, gymDays: 4,
+    compounds: '3×2 @ ~90% paired with jumps', isolation: 'Reduced. Contrast pairs on lower days; upper work holds.', rung: 4,
+    brief:
+      'Turn eleven weeks of strength into speed. Contrast pairs — a heavy double, ninety seconds, then a jump. Running drops back to one maintenance session; you banked that fitness in Block 5 and it keeps for months. Plyo goes to Rung 4.',
+    targets: ['78.5 kg', 'Contrast method', 'Plyo Rung 4', 'Running to maintenance'],
+  },
+  {
+    n: 7, name: 'Pre-Season Specific', short: 'Pre-season', from: '2027-04-26', to: '2027-06-06', weeks: 6, gymDays: 3,
+    compounds: '3×3 @ ~85%, fast and short', isolation: 'Push and Pull merge into one upper day. The slope leads now.', rung: 4,
+    brief:
+      'Slope volume becomes the priority and the gym starts serving it rather than leading it. Book Stoke weekly if you can get it. Gym drops to three sessions, all short and fast. Every session now has to answer: does this make me quicker between two gates?',
+    targets: ['79.5 kg', 'Stoke weekly', '3 gym sessions', 'Race simulation runs'],
+  },
+  {
+    n: 8, name: 'Race Season', short: 'Season', from: '2027-06-07', to: '2027-07-11', weeks: 5, gymDays: 2,
+    compounds: '2×4 @ ~80%, maintain', isolation: 'One lower, one upper. No soreness, no new exercises.', rung: 4,
+    brief:
+      'Race into form. Slot in whatever the summer calendar offers — every start is a rehearsal for July. Gym is two maintenance sessions a week, no soreness, no experiments. Nothing new gets introduced from here on.',
+    targets: ['80 kg', 'Race into form', '2 gym sessions', 'Zero new stimuli'],
+  },
+  {
+    n: 9, name: 'Taper & Champs', short: 'Taper', from: '2027-07-12', to: '2027-07-25', weeks: 2, gymDays: 2,
+    compounds: '2×2 @ ~85%, speed only', isolation: 'Half of Block 8. Fresh beats fit.', rung: 4,
+    brief:
+      'Half the volume, all of the intensity. Short, sharp, fast, and nothing that leaves a mark. Sauna yes, long cold no. You cannot get fitter in a fortnight — you can only arrive fresh or arrive tired.',
+    targets: ['79–80 kg', 'Fresh over fit', 'Sharpen only', 'Win it'],
+  },
 ];
 
-/** Recovery weeks. Week 15 is Christmas; week 39 absorbs Bolton. */
-export const DELOADS = new Set([4, 8, 12, 15, 20, 24, 28, 32, 36, 39]);
+export function blockFor(iso: string): Block {
+  for (const b of BLOCKS) if (iso >= b.from && iso <= b.to) return b;
+  return iso < BLOCKS[0].from ? BLOCKS[0] : BLOCKS[BLOCKS.length - 1];
+}
 
-export const GATES: Record<number, { n: number; title: string; test: string }> = {
-  20: { n: 1, title: 'Gate 1 — Base complete',
-        test: 'FTP ≥ 250 W · 5 km ≤ 20:30 · CSS ≤ 1:45 · a 4 h ride completed comfortably. This is where sub-10 is quietly won or lost.' },
-  38: { n: 2, title: 'Gate 2 — IRONMAN 70.3 Bolton',
-        test: 'Under 4:45, with a bike split under 2:35 and a half-marathon under 1:28 off it.' },
-  42: { n: 3, title: 'Gate 3 — Peak confirmation',
-        test: '5 h at 215 W normalised, then 45 min at 4:45/km or better, with normal next-day recovery.' },
+/** How far through the current block, 0–1. */
+export function blockProgress(iso: string): number {
+  const b = blockFor(iso);
+  const span = daysBetween(b.from, b.to) + 1;
+  const done = daysBetween(b.from, iso) + 1;
+  return Math.max(0, Math.min(1, done / span));
+}
+
+/* --------------------------------------------------------------- races */
+
+export type Race = {
+  day: string;
+  end: string;
+  name: string;
+  venue: string;
+  aim: string;
+  /** Not a race — a test day. */
+  test?: boolean;
+  target?: boolean;
 };
 
-export function blockFor(week: number): Block {
-  return BLOCKS.find((b) => week >= b.from && week <= b.to) ?? BLOCKS[BLOCKS.length - 1];
+export const RACES: Race[] = [
+  { day: '2026-09-04', end: '2026-09-04', name: 'One year post-op', venue: 'Not a race — baseline test day', aim: 'Full symmetry battery. The number everything else gets measured against.', test: true },
+  { day: '2026-09-12', end: '2026-09-13', name: 'Welsh Championships', venue: 'Dryslope', aim: 'Baseline' },
+  { day: '2026-09-20', end: '2026-09-20', name: 'Llandudno Club National', venue: 'Llandudno', aim: 'Apply one fix' },
+  { day: '2026-09-26', end: '2026-09-27', name: 'Irish Nationals', venue: 'TBC', aim: 'Optional' },
+  { day: '2026-11-15', end: '2026-11-15', name: 'Implode Club National', venue: 'TBC', aim: 'Mid-build check' },
+  { day: '2027-03-13', end: '2027-03-13', name: 'March checkpoint', venue: 'Not a race — a test day', aim: 'Your original ‘race fit’ date. Full benchmark battery.', test: true },
+  { day: '2027-07-24', end: '2027-07-25', name: 'British Championships', venue: 'Date TBC — 25 July this year', aim: 'The target', target: true },
+];
+
+/** The next real race after (or on) `iso`, ignoring test days and the Champs. */
+export function nextRace(iso: string): Race | null {
+  return RACES.find((r) => r.end >= iso && !r.test && !r.target) ?? null;
 }
 
-/* ------------------------------------------------------------------ dates */
-
-export function isoDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+export function nextAnything(iso: string): Race | null {
+  return RACES.find((r) => r.end >= iso) ?? null;
 }
+
+/** True when `iso` falls in a week containing a race — the override week. */
+export function isRaceWeek(iso: string): boolean {
+  const mon = mondayOf(iso);
+  const sun = addDays(mon, 6);
+  return RACES.some((r) => !r.test && r.day <= sun && r.end >= mon);
+}
+
+export function raceThisWeek(iso: string): Race | null {
+  const mon = mondayOf(iso);
+  const sun = addDays(mon, 6);
+  return RACES.find((r) => !r.test && r.day <= sun && r.end >= mon) ?? null;
+}
+
+/* -------------------------------------------------------- post-op clock */
+
+export function monthsPostOp(iso: string): number {
+  return daysBetween(SURGERY, iso) / 30.44;
+}
+
+/* ---------------------------------------------------------- bodyweight */
 
 /**
- * Coerce anything date-shaped to 'YYYY-MM-DD'. Dates reach these helpers from
- * the database, from URL params and from the browser, and exactly one of those
- * hands back a Date object. Rather than trusting every caller, the helpers
- * defend their own boundary — a calendar day is a string here, always.
+ * The ramp is 70 → 80 kg across 47 weeks, roughly 0.21 kg a week, but it is not
+ * a straight line: the early kilos come back quickly and the taper holds flat.
+ * These are the block-end checkpoints; everything between is interpolated.
  */
-export function toIso(v: unknown): string {
-  if (v instanceof Date) {
-    return Number.isNaN(v.getTime())
-      ? isoDate(new Date())
-      : `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`;
-  }
-  const s = String(v ?? '').slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : isoDate(new Date());
-}
+const WEIGHT_POINTS: [string, number][] = [
+  ['2026-08-31', 70.0],
+  ['2026-09-27', 70.0],
+  ['2026-11-08', 72.5],
+  ['2026-12-20', 74.0],
+  ['2027-01-31', 75.5],
+  ['2027-03-14', 77.0],
+  ['2027-04-25', 78.5],
+  ['2027-06-06', 79.5],
+  ['2027-07-11', 80.0],
+  ['2027-07-25', 80.0],
+];
 
-export function addDays(iso: string | Date, n: number): string {
-  const d = new Date(toIso(iso) + 'T12:00:00Z');
-  d.setUTCDate(d.getUTCDate() + (Number.isFinite(n) ? n : 0));
-  return isoDate(d);
-}
-
-/** Programme week number for a date. 1 on the start week; 0 or less before it. */
-export function weekFor(startDate: string | Date, day: string | Date): number {
-  const a = new Date(toIso(startDate) + 'T12:00:00Z').getTime();
-  const b = new Date(toIso(day) + 'T12:00:00Z').getTime();
-  return Math.floor((b - a) / (7 * 86400_000)) + 1;
-}
-
-export function weekStart(startDate: string | Date, week: number): string {
-  return addDays(startDate, (week - 1) * 7);
-}
-
-export function labelFor(iso: string | Date): string {
-  const d = new Date(toIso(iso) + 'T12:00:00Z');
-  return d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
-}
-
-/* ------------------------------------------------------------------ zones */
-
-export type Zones = ReturnType<typeof zones>;
-
-export function zones(s: Settings) {
-  const ftp = s.ftp ?? null;
-  const css = s.css_sec ?? null;
-  const fiveK = s.five_k_sec ?? null;
-
-  const w = (lo: number, hi: number) =>
-    ftp ? `${Math.round(ftp * lo)}–${Math.round(ftp * hi)} W` : `${Math.round(lo * 100)}–${Math.round(hi * 100)}% FTP`;
-
-  // Threshold pace ≈ 5 km pace + 15 s/km at this training age.
-  const thrPerKm = fiveK ? fiveK / 5 + 15 : null;
-  const pace = (offset: number) =>
-    thrPerKm ? `${ms(thrPerKm + offset)}/km` : offset >= 40 ? 'easy Z2' : offset > 0 ? 'steady' : 'threshold';
-
-  const swim = (offset: number) =>
-    css ? `${ms(css + offset)}/100 m` : offset > 4 ? 'easy' : offset > 0 ? 'CSS + a touch' : 'CSS pace';
-
-  return {
-    ftp, css, fiveK,
-    z2: w(0.56, 0.75),
-    z3: w(0.76, 0.90),
-    ss: w(0.88, 0.93),
-    z4: w(0.91, 1.05),
-    z5: w(1.06, 1.20),
-    imPower: ftp ? `${Math.round(ftp * 0.72)} W` : 'Ironman race power (~72% FTP)',
-    easyRun: pace(50),
-    steadyRun: pace(22),
-    thrRun: pace(0),
-    marathonRun: pace(30),
-    cssPace: swim(0),
-    cssEasy: swim(9),
-    racePaceSwim: swim(5),
-  };
-}
-
-/* -------------------------------------------------------------- templates */
-
-type Spec = [dow: number, slot: Slot, disc: Disc, title: string, detail: string, minutes: number, key?: 'K' | 'KI'];
-
-function foundation(week: number, Z: Zones): Spec[] {
-  if (week === 1) return [
-    [1, 'PM', 'ST', 'Strength A — technique first', 'Squat, bench, single-leg RDL, pull-up, Pallof, calf raise. 3×8 at RPE 6. Record every load — this is your baseline.', 50],
-    [2, 'AM', 'RN', 'Easy aerobic + strides', 'Conversational throughout. Finish with 6×20 s strides on grass.', 40],
-    [3, 'AM', 'SW', 'TEST — swim baseline', '600 m warm-up with drills, then 400 m time trial, 10 min easy, 200 m time trial. Film 50 m from the side if you can. This sets your CSS.', 55, 'K'],
-    [4, 'PM', 'BK', 'Learn the bike', 'Easy spin. Hold 85–95 rpm. No power targets — get comfortable and note anything that rubs, aches or does not fit.', 60],
-    [5, 'PM', 'RN', 'TEST — 5 km time trial', '15 min warm-up with strides, then 5 km hard on a flat measured route you will use every time. 10 min cool-down. Record splits, average HR, max HR.', 45, 'K'],
-    [6, 'AM', 'BK', 'Z2 endurance + fuelling practice', 'Rolling terrain, conversational. Take 60 g of carbohydrate per hour from minute 30 and note what your gut makes of it.', 105, 'K'],
-    [7, 'AM', 'SW', 'Technique only', 'Catch-up drill, single-arm, 6-kick switch, sculling. Ignore the clock entirely.', 45],
-  ];
-  if (week === 2) return [
-    [1, 'PM', 'BK', 'Recovery spin', 'Z1, high cadence. Skip it entirely if Sunday badminton was heavy.', 35],
-    [2, 'AM', 'RN', 'Easy aerobic + strides', `${Z.easyRun}. 6×20 s strides to finish.`, 45],
-    [2, 'PM', 'ST', 'Strength A + TEST', 'Bench press 5RM after a thorough warm-up, then the rest of the session at RPE 6.', 50],
-    [3, 'AM', 'SW', 'Drill ladder', '8×50 form focus. First structured set — hold the shape, not the pace.', 50],
-    [4, 'PM', 'BK', 'TEST — FTP', '20 min warm-up including 3×1 min openers, 5 min all-out, 10 min easy, then 20 min maximal evenly paced. FTP = 95% of the 20 min average. Do not fade in the last five minutes or it does not count.', 75, 'K'],
-    [5, 'PM', 'RN', 'Steady aerobic', `Flat route, relaxed. ${Z.easyRun}.`, 50],
-    [6, 'AM', 'BK', 'Z2 endurance', 'Fuelling at 60 g/h. Same route as last week if you can — it becomes a reference.', 135, 'K'],
-    [6, 'AM', 'RN', 'First brick', 'Easy transition run straight off the bike. Note how the legs feel in the first ten minutes.', 15],
-    [7, 'AM', 'SW', 'TEST — continuous distance', 'How far can you swim unbroken in 30 minutes at a steady effort? Then 10 min technique.', 50, 'K'],
-  ];
-  if (week === 3) return [
-    [1, 'PM', 'ST', 'Strength B', 'Trap-bar deadlift, overhead press, split squat, row, side plank, Copenhagen. 3×8 at RPE 6–7.', 45],
-    [2, 'AM', 'RN', 'Aerobic with structure', `4×3 min at ${Z.steadyRun} inside an easy run. First taste of structure.`, 50],
-    [3, 'AM', 'SW', 'CSS introduction', `8×100 at ${Z.cssEasy}, 20 s rest.`, 50],
-    [4, 'PM', 'BK', 'Sweet spot introduction', `3×8 min at ${Z.ss}, 4 min easy between.`, 75, 'KI'],
-    [5, 'AM', 'RN', 'Shake-out', 'Easy Z1–Z2 before travelling.', 30],
-    [6, 'ALL', 'OT', 'BASI Level 1 — Day 1', 'Log it as other activity: hours on snow, RPE, and how the legs felt after. No structured training today.', 0],
-    [7, 'ALL', 'OT', 'BASI Level 1 — Day 2', 'As yesterday. Prioritise sleep and food over everything else.', 0],
-  ];
-  return [
-    [1, 'PM', 'OT', 'Recovery and review', 'Mobility 15 min. Transfer all six baseline numbers into Settings — that is what makes every prescription from here specific to you.', 20],
-    [2, 'AM', 'RN', 'Easy aerobic + strides', `${Z.easyRun}. 6×20 s strides.`, 50],
-    [3, 'AM', 'SW', 'Technique + CSS', `Drills, then 4×100 at ${Z.cssPace}. Compare the feel to week 1.`, 55],
-    [4, 'PM', 'BK', 'Sweet spot', `4×8 min at ${Z.ss}, 4 min easy. First progression.`, 80, 'KI'],
-    [5, 'PM', 'ST', 'Strength B + spin', 'Strength B, then 20 min easy on the bike.', 60],
-    [6, 'ALL', 'OT', 'BASI Level 1 — Day 3', 'Log hours, RPE and leg soreness.', 0],
-    [7, 'ALL', 'OT', 'BASI Level 1 — Day 4', 'Block 0 ends. Base 1 starts on Monday.', 0],
-  ];
-}
-
-function base1(Z: Zones): Spec[] {
-  return [
-    [1, 'PM', 'SW', 'Technique & drills', 'Drill ladder, then 8×50 with one thing to think about. Frequency beats intensity in the water for months yet.', 50],
-    [1, 'PM', 'RN', 'Recovery jog', 'Z1 only, nothing faster. It keeps run frequency at three without adding stress.', 30],
-    [2, 'AM', 'RN', 'Aerobic with strides', `${Z.easyRun}, then 6×20 s strides. No threshold running in this block, however good the 5 km looks.`, 50, 'KI'],
-    [2, 'PM', 'ST', 'Strength A', 'Full body, bench as the anchor lift.', 40],
-    [3, 'AM', 'SW', 'CSS set', `8–10×100 at ${Z.cssPace}, 20 s rest.`, 45],
-    [3, 'PM', 'BK', 'Z2 endurance', `${Z.z2}, cadence 90–95.`, 60],
-    [4, 'AM', 'BK', 'Sweet spot', `3×10 min at ${Z.ss}, 5 min easy between.`, 70, 'KI'],
-    [4, 'PM', 'ST', 'Strength B', 'Hinge and pull. Reduced volume.', 30],
-    [5, 'PM', 'BK', 'Endurance with climbs', `${Z.z2} with 4×4 min at ${Z.z3} on rises. Finish by 17:30.`, 70],
-    [6, 'AM', 'BK', 'Long ride', `Steady ${Z.z2}. Fuel 60 g carb/h from minute 30.`, 150, 'K'],
-    [6, 'AM', 'RN', 'Transition run', 'Easy off the bike, controlled.', 15],
-    [7, 'AM', 'RN', 'Long run', `${Z.easyRun} throughout, no quality. Finish by midday.`, 70, 'K'],
-  ];
-}
-
-function base2(Z: Zones): Spec[] {
-  return [
-    [1, 'PM', 'SW', 'Technique & drills', '1,800 m — drill ladder, 8×50 form focus.', 50],
-    [1, 'PM', 'RN', 'Recovery jog', 'Z1 only, nothing faster. Skip it if Sunday was heavy.', 30],
-    [2, 'AM', 'RN', 'Threshold', `15 min warm-up, 4×6 min at ${Z.thrRun} with 2 min jog, 10 min cool-down.`, 65, 'KI'],
-    [2, 'PM', 'ST', 'Strength A', 'Full body, bench as the anchor lift.', 40],
-    [3, 'AM', 'SW', 'CSS set', `10×100 at ${Z.cssPace}, 15 s rest.`, 45],
-    [3, 'PM', 'BK', 'Z2 endurance', `${Z.z2} on the trainer, cadence 90–95.`, 60],
-    [4, 'AM', 'BK', 'Sweet spot', `3×12 min at ${Z.ss}, 5 min easy between.`, 75, 'KI'],
-    [4, 'PM', 'ST', 'Strength B', 'Hinge and pull, reduced volume.', 30],
-    [5, 'AM', 'SW', 'Aerobic', '2,000 m steady — continuous-distance focus.', 40],
-    [5, 'PM', 'BK', 'Endurance with climbs', `${Z.z2} with 4×4 min at ${Z.z3} on rises. Finish by 17:30.`, 75],
-    [6, 'AM', 'BK', 'Long ride', `${Z.z2} with 3×15 min at ${Z.z3}. Fuel 70 g carb/h. Record HR drift.`, 180, 'K'],
-    [6, 'AM', 'RN', 'Transition run', 'Off the bike, Z2, controlled.', 20],
-    [7, 'AM', 'RN', 'Long run', `${Z.easyRun} throughout, no quality. Finish by midday.`, 85, 'K'],
-  ];
-}
-
-function build1(Z: Zones): Spec[] {
-  return [
-    [1, 'PM', 'SW', 'Technique + aerobic', '2,200 m. Keep the technical work going — it is still the slowest thing to change.', 55],
-    [1, 'PM', 'RN', 'Recovery jog', 'Z1 only.', 30],
-    [2, 'AM', 'RN', 'Threshold', `4×8 min at ${Z.thrRun}, 2 min jog.`, 70, 'KI'],
-    [2, 'PM', 'ST', 'Strength — maintenance', 'Upper body priority. Heavy lower-body work comes out from here.', 35],
-    [3, 'AM', 'SW', 'CSS', `6×200 at ${Z.cssPace}, 20 s rest.`, 50],
-    [3, 'PM', 'BK', 'Z2 endurance', `${Z.z2}, cadence work.`, 70],
-    [4, 'AM', 'BK', 'Threshold', `4×10 min at ${Z.z4}, 5 min easy between.`, 80, 'KI'],
-    [5, 'PM', 'BK', 'Endurance with race-pace blocks', `${Z.z2} with 3×8 min at ${Z.imPower}. Finish by 17:30.`, 90],
-    [6, 'AM', 'BK', 'Long ride', `Hilly route. ${Z.z2} with 3×20 min at ${Z.imPower} on the climbs.`, 240, 'K'],
-    [6, 'AM', 'RN', 'Brick run', `30 min at ${Z.marathonRun} off the bike.`, 30, 'K'],
-    [7, 'AM', 'RN', 'Long run', `${Z.easyRun}. Finish by midday.`, 95, 'K'],
-  ];
-}
-
-function build2(Z: Zones): Spec[] {
-  return [
-    [1, 'PM', 'SW', 'Technique + aerobic', '2,400 m.', 55],
-    [1, 'PM', 'RN', 'Recovery jog', 'Z1 only.', 30],
-    [2, 'AM', 'RN', 'Threshold', `3×10 min at ${Z.thrRun}, 3 min jog.`, 75, 'KI'],
-    [2, 'PM', 'ST', 'Strength — maintenance', 'Upper body priority, reduced sets.', 35],
-    [3, 'AM', 'SW', 'CSS', `4×400 at ${Z.racePaceSwim}.`, 50],
-    [3, 'PM', 'BK', 'Aero endurance', `${Z.z2} held in the aero position. Cadence work.`, 75],
-    [4, 'AM', 'BK', 'Climb repeats', `6×5 min at ${Z.z4}–${Z.z5}. This is Black Hill Road in miniature — you climb it three times on race day.`, 85, 'KI'],
-    [5, 'AM', 'SW', 'Open water', 'Sighting every 6–8 strokes without breaking rhythm. Wetsuit. 2,000 m.', 45],
-    [5, 'PM', 'RN', 'Long aerobic with marathon pace', `3×10 min at ${Z.marathonRun} inside an easy run. Finish by 17:00.`, 90],
-    [6, 'AM', 'BK', 'Long ride — three laps', `Three laps of a hilly route, race power on every climb. Full race nutrition at 80–90 g/h.`, 285, 'K'],
-    [6, 'AM', 'RN', 'Brick run', `40 min at ${Z.marathonRun}. The session that actually predicts the race.`, 40, 'K'],
-    [7, 'AM', 'RN', 'Long run', `${Z.easyRun} throughout. Finish by midday.`, 100, 'K'],
-  ];
-}
-
-function bolton(week: number, Z: Zones): Spec[] {
-  if (week === 37) return [
-    [1, 'PM', 'SW', 'Technique', 'Easy, 1,800 m.', 45],
-    [2, 'AM', 'RN', 'Sharpener', `2×8 min at ${Z.thrRun}. Short, not hard.`, 55, 'KI'],
-    [3, 'AM', 'SW', 'Race pace', `1,500 m continuous at ${Z.racePaceSwim}.`, 45],
-    [3, 'PM', 'BK', 'Z2 with openers', `${Z.z2} with 4×3 min at ${Z.imPower}.`, 70],
-    [4, 'AM', 'BK', 'Race power', `3×15 min at ${Z.imPower}.`, 75, 'KI'],
-    [5, 'AM', 'ST', 'Strength — the floor', 'One short maintenance session. Bench, row, press. Nothing heavy this close to a race.', 25],
-    [5, 'PM', 'RN', 'Easy + strides', 'Relaxed, 6 strides.', 45],
-    [6, 'AM', 'BK', 'Last long ride before Bolton', `${Z.z2} with 2×20 min at ${Z.imPower}. Full race kit and nutrition — this is the dress rehearsal for the dress rehearsal.`, 180, 'K'],
-    [6, 'AM', 'RN', 'Brick', `20 min at ${Z.marathonRun}.`, 20],
-    [7, 'AM', 'RN', 'Long run, shortened', `${Z.easyRun}.`, 70],
-  ];
-  return [
-    [1, 'PM', 'SW', 'Easy technique', 'Feel the water, nothing more.', 30],
-    [2, 'AM', 'BK', 'Openers', `45 min easy with 4×90 s at ${Z.imPower}. Openers, not a session.`, 45],
-    [2, 'PM', 'RN', 'Shake-out', '20 min easy + 4 strides.', 20],
-    [3, 'AM', 'SW', 'Wetsuit swim', '800 m easy in the wetsuit if you can get to open water.', 25],
-    [4, 'AM', 'RN', 'Shake-out', '25 min very easy + 4 strides. Kit laid out tonight. Fix nothing new.', 25],
-    [5, 'AM', 'BK', 'Legs and bike check', `30 min easy with 2×60 s at ${Z.imPower}.`, 30],
-    [6, 'AM', 'SW', 'Pre-race', '15 min easy swim. Practise the start. Off your feet from midday.', 15],
-    [7, 'ALL', 'OT', 'RACE — IRONMAN 70.3 Bolton', 'Gate 2. Under 4:45 keeps sub-10 live: bike under 2:35, half-marathon under 1:28 off it. Everything you test today is one fewer unknown at Leeds.', 0],
-  ];
-}
-
-function peak(week: number, Z: Zones): Spec[] {
-  if (week === 39) return [
-    [1, 'PM', 'OT', 'Full rest', 'You raced yesterday. Nothing today.', 0],
-    [2, 'PM', 'SW', 'Easy technique', 'Flush the legs.', 35],
-    [3, 'AM', 'BK', 'Easy spin', 'Z1, high cadence.', 45],
-    [4, 'AM', 'RN', 'Easy', `${Z.easyRun}. First run back.`, 35],
-    [5, 'PM', 'BK', 'Z2 endurance', `${Z.z2}, relaxed.`, 75],
-    [6, 'AM', 'BK', 'Moderate long ride', `${Z.z2} only. No intensity — this week absorbs Bolton.`, 150],
-    [7, 'AM', 'RN', 'Long run, easy', `${Z.easyRun}.`, 80],
-  ];
-  return [
-    [1, 'PM', 'SW', 'Easy technique', '1,500 m. Recovery only.', 35],
-    [2, 'AM', 'RN', 'Threshold', `2×15 min at ${Z.thrRun}.`, 75, 'KI'],
-    [2, 'PM', 'SW', 'Aerobic', `3,000 m continuous, last 1,000 at ${Z.racePaceSwim}.`, 55],
-    [3, 'AM', 'BK', 'Aero endurance', `${Z.z2} in full aero position.`, 105],
-    [3, 'PM', 'ST', 'Strength — the floor', 'Bench, row, press, single-leg stability. One session a week keeps the physique and the connective tissue.', 30],
-    [4, 'AM', 'BK', 'Race power on climbs', `3×25 min at ${Z.imPower}.`, 110, 'KI'],
-    [4, 'PM', 'RN', 'Easy + strides', `${Z.easyRun}.`, 45],
-    [5, 'AM', 'SW', 'Open water — full rehearsal', '3,800 m continuous in the wetsuit. Needs a half-day or a lake that opens at 06:00 — sort this out in advance, it will not fit around a normal Friday.', 75],
-    [6, 'AM', 'BK', 'THE session', `Race power throughout, full race nutrition at 90 g/h. This is the one that decides the race plan.`, 300, 'K'],
-    [6, 'AM', 'RN', 'Brick', `45 min at ${Z.marathonRun}. If this goes well the plan is confirmed. If it does not, the bike target comes down.`, 45, 'K'],
-    [7, 'AM', 'RN', 'Long run', `${Z.easyRun} with the final 20 min at ${Z.steadyRun}.`, 125, 'K'],
-  ];
-}
-
-function taper(week: number, Z: Zones): Spec[] {
-  if (week === 44) return [
-    [1, 'PM', 'SW', 'Easy technique', '1,500 m.', 35],
-    [2, 'AM', 'RN', 'Short threshold', `3×5 min at ${Z.thrRun}. Sharp and short — intensity is retained, volume is not.`, 50, 'KI'],
-    [4, 'AM', 'BK', 'Race power', `3×10 min at ${Z.imPower}.`, 70, 'KI'],
-    [3, 'AM', 'SW', 'Race pace', `2,000 m with 4×200 at ${Z.racePaceSwim}.`, 45],
-    [3, 'PM', 'RN', 'Easy + strides', `${Z.easyRun}.`, 40],
-    [5, 'PM', 'BK', 'Z2', `${Z.z2}, relaxed.`, 75],
-    [6, 'AM', 'BK', 'Last moderate ride', `${Z.z2} with 3×10 min at ${Z.imPower}.`, 150, 'K'],
-    [6, 'AM', 'RN', 'Short brick', `20 min at ${Z.marathonRun}.`, 20],
-    [7, 'AM', 'RN', 'Last long-ish run', `${Z.easyRun}. Badminton stops from this week — lateral loading two weeks out is a risk with no upside.`, 80],
-  ];
-  return [
-    [1, 'AM', 'SW', 'Easy technique', '1,200 m. Feel the water, nothing more.', 30],
-    [2, 'AM', 'BK', 'Openers', `45 min easy with 4×90 s at ${Z.imPower}. Openers, not a session.`, 45],
-    [2, 'PM', 'RN', 'Shake-out', '20 min easy + 4 strides.', 20],
-    [3, 'AM', 'SW', 'Wetsuit swim', '800 m easy in the wetsuit if possible. Kit check: lay everything out, charge everything, fix nothing new.', 25],
-    [4, 'AM', 'RN', 'Shake-out', '25 min very easy + 4 strides. Start carbohydrate loading — 8–10 g/kg/day.', 25],
-    [5, 'AM', 'BK', 'Legs and bike check', `30 min easy with 2×60 s at ${Z.imPower}. Travel to Leeds. Registration.`, 30],
-    [6, 'AM', 'SW', 'Pre-race', '15 min easy in Waterloo Lake if it is open. Practise the start, then off your feet from midday. Bed by 21:00.', 15],
-    [7, 'ALL', 'OT', 'RACE DAY — IRONMAN LEEDS', 'You cannot win this on the first lap of the bike, but you can absolutely lose it there. Ride lap one five watts under target and fuel from minute 20.', 0],
-  ];
-}
-
-/* ------------------------------------------------------------- generation */
-
-/** Scale within the 3:1 loading cycle. */
-function weekScale(week: number, block: Block): number {
-  if (DELOADS.has(week)) return 0.62;
-  if (block.tpl === 'bolton' || block.tpl === 'taper') return 1;
-  // Position inside the current build run: 0.92 → 1.00 → 1.08
-  let pos = 0;
-  for (let w = week - 1; w >= block.from; w--) {
-    if (DELOADS.has(w)) break;
-    pos++;
-  }
-  // Week 43 is the last big week before the taper — it steps down, it does not peak.
-  if (week === 43) return 0.90;
-  return [0.92, 1.0, 1.08][Math.min(pos, 2)];
-}
-
-function template(week: number, Z: Zones): Spec[] {
-  const b = blockFor(week);
-  switch (b.tpl) {
-    case 'found': return foundation(week, Z);
-    case 'base1': return base1(Z);
-    case 'base2': return base2(Z);
-    case 'build1': return build1(Z);
-    case 'build2': return build2(Z);
-    case 'bolton': return bolton(week, Z);
-    case 'peak': return peak(week, Z);
-    case 'taper': return taper(week, Z);
-  }
-}
-
-/** Badminton policy by block — a recommendation the plan shows, not a rule it enforces. */
-function badminton(week: number, s: Settings): { fri: boolean; sun: boolean; note: string } {
-  const b = blockFor(week);
-  if (b.n >= 7) return { fri: false, sun: false, note: 'Both sessions stop from Week 44 — lateral loading this close to the race is risk with no fitness benefit.' };
-  if (b.n >= 4) return { fri: false, sun: s.badminton_sun, note: 'Sunday only from here. Six extra hours of high-intensity intermittent load is the most likely single cause of an injury or a stalled bike block.' };
-  if (b.n === 3) return { fri: s.badminton_fri, sun: s.badminton_sun, note: 'Friday is now conditional — drop it in any week where Saturday carries a key session and readiness is not green.' };
-  return { fri: s.badminton_fri, sun: s.badminton_sun, note: 'Both sessions are affordable at this volume, and they are good for you. Log them honestly — they count at 0.7× endurance load.' };
-}
-
-export function weekPlan(week: number, s: Settings): PlannedDay[] {
-  const Z = zones(s);
-  const block = blockFor(week);
-  const scale = weekScale(week, block);
-  const specs = template(week, Z);
-  const bad = badminton(week, s);
-  const monday = weekStart(s.start_date, week);
-  const poolM = poolLength(s);
-
-  const days: PlannedDay[] = [];
-  for (let dow = 1; dow <= 7; dow++) {
-    const date = addDays(monday, dow - 1);
-    const sessions: PlannedSession[] = specs
-      .filter((sp) => sp[0] === dow)
-      .map((sp, i) => {
-        const [, slot, disc, title, detail, minutes, key] = sp;
-        const scaled = minutes ? Math.max(15, Math.round((minutes * scale) / 5) * 5) : 0;
-        return {
-          key: `w${week}-d${dow}-${i}`,
-          slot, disc, title,
-          // Swim prescriptions are written in metres; show the length count too,
-          // because lengths are what you actually count in the water.
-          detail: disc === 'SW' ? withLengths(detail, poolM) : detail,
-          minutes: scaled,
-          keySession: key === 'K' || key === 'KI',
-          keyIntensity: key === 'KI',
-        };
-      });
-
-    if (dow === 5 && bad.fri) {
-      sessions.push({
-        key: `w${week}-d5-bad`, slot: 'EVE', disc: 'OT',
-        title: 'Badminton', detail: '19:00–22:00. Log it — it counts as 2.1 equivalent training hours.',
-        minutes: 180, keySession: false, keyIntensity: false,
-      });
+export function targetWeight(iso: string): number {
+  const pts = WEIGHT_POINTS;
+  if (iso <= pts[0][0]) return pts[0][1];
+  if (iso >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+  for (let i = 1; i < pts.length; i++) {
+    if (iso <= pts[i][0]) {
+      const [d0, w0] = pts[i - 1];
+      const [d1, w1] = pts[i];
+      const span = daysBetween(d0, d1) || 1;
+      const t = daysBetween(d0, iso) / span;
+      return Math.round((w0 + (w1 - w0) * t) * 10) / 10;
     }
-    if (dow === 7 && bad.sun) {
-      sessions.push({
-        key: `w${week}-d7-bad`, slot: 'EVE', disc: 'OT',
-        title: 'Badminton', detail: '19:00–22:00. Tomorrow is a recovery day for exactly this reason.',
-        minutes: 180, keySession: false, keyIntensity: false,
-      });
-    }
-
-    days.push({ date, dow, label: labelFor(date), sessions });
   }
-
-  if (DELOADS.has(week)) {
-    days[0].note = 'Recovery week — around 62% of normal volume. Intensity is kept, tonnage is not. Do not "top it up" because you feel good.';
-  }
-  const gate = GATES[week];
-  if (gate) days[0].note = `${gate.title}. ${gate.test}`;
-
-  return days;
-}
-
-/** Structured minutes by discipline for a week (badminton excluded). */
-export function weekTotals(days: PlannedDay[]) {
-  const t = { SW: 0, BK: 0, RN: 0, ST: 0, total: 0 };
-  for (const d of days) for (const s of d.sessions) {
-    if (s.disc === 'OT') continue;
-    t[s.disc] += s.minutes;
-    t.total += s.minutes;
-  }
-  return t;
-}
-
-/** Equivalent training hours, including other activity. */
-export function eth(days: PlannedDay[]): number {
-  let e = 0;
-  for (const d of days) for (const s of d.sessions) {
-    const h = s.minutes / 60;
-    if (s.disc === 'OT') e += h * 0.7;
-    else if (s.disc === 'ST') e += h * 0.8;
-    else if (s.keyIntensity) e += h * 1.5;
-    else if (h > 3) e += h * 1.2;
-    else e += h;
-  }
-  return e;
+  return 80;
 }

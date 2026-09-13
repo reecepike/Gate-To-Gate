@@ -1,132 +1,141 @@
 import { redirect } from 'next/navigation';
-import Link from 'next/link';
 import { currentUser } from '@/lib/auth';
-import { getSettings, sessionsBetween } from '@/lib/db';
-import { weekPlan, weekFor, blockFor, weekTotals, eth, GATES, DELOADS, addDays, weekStart } from '@/lib/plan';
+import { ticksFor, getSlots } from '@/lib/db';
+import { context } from '@/lib/coach';
+import { WEEK, WEEK_TASKS, RACE_OVERRIDE } from '@/lib/week';
+import { toIso, fmt, mondayOf, addDays, weekFor } from '@/lib/plan';
+import { daysInBlock } from '@/lib/gym';
+import { slotsOn, fmtMinutes } from '@/lib/work';
+import { toggleTickAction, resetWeekAction, saveWeeklyNoteAction } from '../actions';
 import Nav from '../_components/Nav';
+import Mast from '../_components/Mast';
 
 export const dynamic = 'force-dynamic';
 
-const DISC_NAME: Record<string, string> = { SW: 'Swim', BK: 'Bike', RN: 'Run', ST: 'Strength', OT: 'Other' };
-
-export default async function WeekPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ w?: string }>;
-}) {
+export default async function WeekPage() {
   if (!(await currentUser())) redirect('/login');
-  const params = await searchParams;
-  const s = await getSettings();
 
-  const todayIso = new Date().toISOString().slice(0, 10);
-  const current = Math.min(45, Math.max(1, weekFor(s.start_date, todayIso)));
-  const week = Math.min(45, Math.max(1, Number(params.w) || current));
-
-  const block = blockFor(week);
-  const days = weekPlan(week, s);
-  const totals = weekTotals(days);
-  const load = eth(days);
-  const gate = GATES[week];
-
-  const from = weekStart(s.start_date, week);
-  const to = addDays(from, 6);
-  const logged = await sessionsBetween(from, to);
-  const loggedKeys = new Set(logged.map((l) => l.plan_key).filter(Boolean));
-  const doneMin = logged.reduce((a, r) => a + (r.duration_min ?? 0), 0);
-
-  const pct = (n: number) => (totals.total ? Math.round((n / totals.total) * 100) : 0);
+  const day = toIso(new Date());
+  const ctx = context(day);
+  const week = weekFor(day);
+  const [ticks, slots] = await Promise.all([ticksFor(week), getSlots()]);
+  const mon = mondayOf(day);
+  const doneCount = WEEK_TASKS.filter((t) => ticks[t]).length;
+  const lifting = daysInBlock(ctx.block);
 
   return (
-    <>
-      <div className="wrap wide">
-        <header className="mast">
-          <div>
-            <h1>Week {week}</h1>
-            <div className="xs">Block {block.n} — {block.name}</div>
-          </div>
-          <div className="right">
-            <div>
-              <div className="lab">Planned</div>
-              <div className="v">{(totals.total / 60).toFixed(1)} h</div>
-            </div>
-            <div>
-              <div className="lab">Logged</div>
-              <div className="v">{(doneMin / 60).toFixed(1)} h</div>
-            </div>
-          </div>
-        </header>
+    <div className="wrap">
+      <Mast ctx={ctx} title="The week" />
 
-        <div className="row" style={{ marginBottom: 16 }}>
-          {week > 1 && <Link className="btn ghost" href={`/week?w=${week - 1}`}>← Week {week - 1}</Link>}
-          {week !== current && <Link className="btn ghost" href="/week">This week</Link>}
-          {week < 45 && <Link className="btn ghost" href={`/week?w=${week + 1}`}>Week {week + 1} →</Link>}
+      <div className="note neutral">
+        <b>Two fixed points.</b> Nothing starts before 07:30, and Wednesday belongs to Aldershot. Everything else is
+        arranged around those — which is why the gym sits at 08:15 and Wednesday compresses to a 5¾-hour working day.
+      </div>
+
+      {ctx.raceWeek && (
+        <div className="verdict amber">
+          <h2>Race week — {ctx.raceWeek.name}</h2>
+          <p>{fmt(ctx.raceWeek.day)}{ctx.raceWeek.end !== ctx.raceWeek.day && `–${fmt(ctx.raceWeek.end)}`} · {ctx.raceWeek.venue} · aim: {ctx.raceWeek.aim}. The override below applies.</p>
         </div>
+      )}
 
-        {gate && <div className="note"><b>{gate.title}</b> — {gate.test}</div>}
-        {DELOADS.has(week) && !gate && (
-          <div className="note neutral">
-            <b>Recovery week</b> — about 62% of normal volume, intensity retained.
-            {week === 15 && ' Christmas falls here, which is why the deload is scheduled where it is.'}
-            {week === 39 && ' This week absorbs Bolton.'}
-          </div>
-        )}
+      <div className="kpis">
+        <div className="kpi acc"><div className="v acc">{lifting.length}</div><div className="n">Lifting days this block</div></div>
+        <div className="kpi"><div className="v">90 min</div><div className="n">On plastic — plus Stoke 1-2-1s</div></div>
+        <div className="kpi"><div className="v">8.4 h</div><div className="n">Sleep, weekly average</div></div>
+        <div className="kpi"><div className="v">{doneCount}/{WEEK_TASKS.length}</div><div className="n">Ticked this week</div></div>
+      </div>
 
-        <div className="kpis">
-          <div className="kpi acc"><div className="lab">Equivalent load</div>
-            <div className="v acc">{load.toFixed(1)} ETH</div>
-            <div className="n">Structured training plus badminton at 0.7×</div></div>
-          <div className="kpi"><div className="lab">Swim</div><div className="v">{pct(totals.SW)}%</div>
-            <div className="n">{(totals.SW / 60).toFixed(1)} h</div></div>
-          <div className="kpi"><div className="lab">Bike</div><div className="v">{pct(totals.BK)}%</div>
-            <div className="n">{(totals.BK / 60).toFixed(1)} h</div></div>
-          <div className="kpi"><div className="lab">Run</div><div className="v">{pct(totals.RN)}%</div>
-            <div className="n">{(totals.RN / 60).toFixed(1)} h</div></div>
-          <div className="kpi"><div className="lab">Strength</div><div className="v">{pct(totals.ST)}%</div>
-            <div className="n">{(totals.ST / 60).toFixed(1)} h</div></div>
-        </div>
-
-        {days.map((d) => (
-          <div className="card" key={d.date} style={{ padding: 0 }}>
-            <div style={{
-              display: 'flex', alignItems: 'baseline', gap: 10,
-              padding: '10px 14px', borderBottom: '1px solid var(--rule-2)',
-              background: d.date === todayIso ? 'var(--rust-soft)' : 'var(--surface-2)',
-            }}>
-              <b style={{ fontFamily: 'Archivo, sans-serif' }}>{d.label}</b>
-              {d.date === todayIso && <span className="chip key">Today</span>}
-              <span className="xs" style={{ marginLeft: 'auto' }}>
-                {d.sessions.filter((x) => x.disc !== 'OT').reduce((a, x) => a + x.minutes, 0)} min
-              </span>
-            </div>
-            {d.note && <div className="xs" style={{ padding: '8px 14px', background: 'var(--rust-soft)' }}>{d.note}</div>}
-            {d.sessions.length === 0 ? (
-              <div className="sesh-b muted">Rest. Take it — it is a session.</div>
-            ) : (
-              d.sessions.map((x) => (
-                <div key={x.key} style={{ padding: '10px 14px', borderBottom: '1px solid var(--rule-2)' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <span className="slot mono xs">{x.slot}</span>
-                    <span className={`disc d-${x.disc}`}>{DISC_NAME[x.disc]}</span>
-                    <b style={{ fontSize: 14 }}>{x.title}</b>
-                    {x.keySession && <span className="chip key">Key</span>}
-                    {loggedKeys.has(x.key) && <span className="chip plain">Logged</span>}
-                    <span className="num" style={{ marginLeft: 'auto', fontWeight: 700 }}>
-                      {x.minutes ? `${x.minutes} min` : '—'}
-                    </span>
-                  </div>
-                  <div className="small muted" style={{ marginTop: 4 }}>{x.detail}</div>
-                </div>
-              ))
+      {/* --------------------------------------------------- the days */}
+      {WEEK.map((d) => {
+        const dayIso = addDays(mon, d.weekday - 1);
+        const isToday = dayIso === day;
+        const ws = slotsOn(dayIso, slots);
+        return (
+          <div className="card" key={d.weekday} style={isToday ? { borderLeft: '3px solid var(--rust)' } : undefined}>
+            <h2>
+              {d.name}
+              {isToday && <span className="chip key" style={{ marginLeft: 8 }}>Today</span>}
+            </h2>
+            <p className="desc">{d.headline} · {fmt(dayIso)}</p>
+            {d.slots.map((s) => (
+              <div key={s.time + s.label} style={{ display: 'flex', gap: 12, padding: '7px 0', borderBottom: '1px solid var(--rule-2)' }}>
+                <span className="mono xs" style={{ width: 46, flexShrink: 0, paddingTop: 2 }}>{s.time}</span>
+                <span style={{ flex: 1 }}>
+                  <b style={{ fontSize: 14 }}>{s.label}</b>
+                  {s.detail && <div className="xs" style={{ marginTop: 2 }}>{s.detail}</div>}
+                </span>
+              </div>
+            ))}
+            {ws.length > 0 && (
+              <p className="xs" style={{ marginTop: 10, marginBottom: 0 }}>
+                Own businesses: {ws.map((s) => `${s.time} (${fmtMinutes(s.minutes)})`).join(' · ')}
+              </p>
             )}
           </div>
-        ))}
+        );
+      })}
 
-        <p className="xs">
-          Durations scale with the loading cycle, and every prescription uses your tested numbers
-          where they exist. Update them in Settings and this whole page changes.
-        </p>
+      {/* ------------------------------------------------- race override */}
+      <div className="card">
+        <h2>Race weekend override</h2>
+        <p className="desc">Swap this in when you are racing Saturday or Sunday.</p>
+        <div className="scroll">
+          <table>
+            <thead><tr><th>Day</th><th>Change</th><th>Why</th></tr></thead>
+            <tbody>
+              {RACE_OVERRIDE.map((r) => (
+                <tr key={r.day}>
+                  <td className="k mono">{r.day}</td>
+                  <td>{r.change}</td>
+                  <td className="xs">{r.why}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
+
+      {/* ---------------------------------------------------- the ticks */}
+      <div className="card">
+        <h2>This week&rsquo;s ticks</h2>
+        <p className="desc">Week {week} · {doneCount} of {WEEK_TASKS.length} done</p>
+        {WEEK_TASKS.map((t) => {
+          const on = !!ticks[t];
+          return (
+            <form action={toggleTickAction} key={t}>
+              <input type="hidden" name="week" value={week} />
+              <input type="hidden" name="task" value={t} />
+              <input type="hidden" name="done" value={on ? 'false' : 'true'} />
+              <button
+                type="submit"
+                className="tick"
+                aria-pressed={on}
+              >
+                <span className="box">{on ? '✓' : ''}</span>
+                <span className={on ? 'struck' : ''}>{t}</span>
+              </button>
+            </form>
+          );
+        })}
+        <form action={resetWeekAction} style={{ marginTop: 12 }}>
+          <input type="hidden" name="week" value={week} />
+          <button className="ghost wide" type="submit">Reset the week</button>
+        </form>
+      </div>
+
+      {/* ------------------------------------------------- weekly note */}
+      <form action={saveWeeklyNoteAction} className="card">
+        <h2>Sunday, ten minutes</h2>
+        <p className="desc">The slot at 20:00. Three lines is enough — it is the thing that makes next week better than this one.</p>
+        <input type="hidden" name="week" value={week} />
+        <label className="f"><span className="lab">What went well</span><textarea name="went_well" /></label>
+        <label className="f"><span className="lab">What did not</span><textarea name="went_badly" /></label>
+        <label className="f"><span className="lab">One change for next week</span><input type="text" name="one_change" /></label>
+        <button className="wide" type="submit">Save the week</button>
+      </form>
+
       <Nav active="/week" />
-    </>
+    </div>
   );
 }

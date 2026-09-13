@@ -1,34 +1,48 @@
 import { redirect } from 'next/navigation';
 import { currentUser } from '@/lib/auth';
-import { getSettings, getCheckIn, recentCheckIns, weightSeries } from '@/lib/db';
-import { toIso, labelFor } from '@/lib/plan';
+import { getSettings, getReadiness, recentReadiness } from '@/lib/db';
+import { assess, sleepHoursFrom } from '@/lib/readiness';
+import { toIso, fmtLong } from '@/lib/plan';
 import { saveCheckInAction } from '../actions';
 import Nav from '../_components/Nav';
 
 export const dynamic = 'force-dynamic';
 
-function Choice({
-  name, label, options, value, help,
-}: {
-  name: string; label: string; options: string[]; value: string | null; help?: string;
+/**
+ * The morning check-in.
+ *
+ * It gates the app once a day and then gets out of the way. Everything
+ * downstream — the readiness verdict, whether today's session happens, the
+ * shape of the timetable, the score tonight — is built on these numbers, and
+ * inventing them would quietly corrupt all four.
+ *
+ * It is deliberately arranged so the first screenful is the part that matters
+ * and takes about twenty seconds. Everything else is optional and folded away.
+ */
+
+function Ten({ name, label, low, high, value }: {
+  name: string; label: string; low: string; high: string; value?: number | null;
 }) {
   return (
-    <div style={{ marginBottom: 16 }}>
-      <div className="lab" style={{ marginBottom: 5 }}>{label}</div>
-      <div className="scale5" style={{ gap: 6 }}>
-        {options.map((o) => (
-          <span key={o} style={{ flex: 1, position: 'relative' }}>
-            <input type="radio" name={name} id={`${name}-${o}`} value={o} defaultChecked={value === o} />
-            <label htmlFor={`${name}-${o}`} style={{ fontSize: 13, textTransform: 'capitalize' }}>{o}</label>
+    <div style={{ marginBottom: 18 }}>
+      <div className="lab" style={{ marginBottom: 7 }}>{label}</div>
+      <div className="scale10">
+        {Array.from({ length: 10 }, (_, n) => n + 1).map((v) => (
+          <span key={v} style={{ flex: 1, position: 'relative' }}>
+            <input type="radio" id={`${name}-${v}`} name={name} value={v} defaultChecked={value === v} />
+            <label htmlFor={`${name}-${v}`}>{v}</label>
           </span>
         ))}
       </div>
-      {help && <div className="xs" style={{ marginTop: 4 }}>{help}</div>}
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 5 }}>
+        <span className="xs">{low}</span>
+        <span className="xs">{high}</span>
+      </div>
     </div>
   );
 }
 
-export default async function CheckInPage({
+export default async function CheckIn({
   searchParams,
 }: {
   searchParams: Promise<{ day?: string }>;
@@ -37,99 +51,154 @@ export default async function CheckInPage({
   const params = await searchParams;
   const day = params.day ?? toIso(new Date());
 
-  const [s, existing, recent, weights] = await Promise.all([
-    getSettings(), getCheckIn(day), recentCheckIns(day, 10), weightSeries(30),
+  const [settings, existing, history] = await Promise.all([
+    getSettings(), getReadiness(day), recentReadiness(day, 30),
   ]);
 
-  const last7 = weights.slice(-7);
-  const avg7 = last7.length ? last7.reduce((a, w) => a + w.weight, 0) / last7.length : null;
+  const done = !!existing?.checked_in_at;
+  const verdict = existing ? assess(existing, history.filter((r) => r.day !== day)) : null;
+  const sleepH = existing ? sleepHoursFrom(existing) : null;
 
   return (
-    <>
-      <div className="wrap" style={{ maxWidth: 560 }}>
-        <header className="mast">
-          <div>
-            <h1>Check-in</h1>
-            <div className="xs">{labelFor(day)} · thirty seconds</div>
-          </div>
-          {avg7 && (
-            <div className="right">
-              <div><div className="lab">7-day avg</div><div className="v">{avg7.toFixed(1)}</div></div>
-            </div>
-          )}
-        </header>
+    <div className="wrap">
+      <header className="mast">
+        <div>
+          <div className="greet">{done ? 'Editing' : 'Before anything else'}</div>
+          <h1>Check in</h1>
+        </div>
+      </header>
 
-        <div className="note neutral">
-          Answer these the same careless way every day. A consistent gut answer is worth far more than a considered one,
-          because only the trend is used — and a single morning never changes anything on its own.
+      {done && verdict ? (
+        <div className={`verdict ${verdict.band}`}>
+          <h2>Readiness {verdict.score} — {verdict.headline}</h2>
+          <p>{verdict.action}</p>
+          {sleepH != null && <p className="xs" style={{ marginTop: 8 }}>{sleepH.toFixed(1)} h of sleep logged.</p>}
+        </div>
+      ) : (
+        <div className="note">
+          <b>Thirty seconds, once a day.</b> Today&rsquo;s training decision, the shape of the
+          timetable and tonight&rsquo;s score are all built on these numbers. It will not ask
+          again — and you can come back and edit it whenever you like.
+        </div>
+      )}
+
+      <form action={saveCheckInAction}>
+        <input type="hidden" name="day" value={day} />
+
+        {/* ------------------------------------------------------- sleep */}
+        <div className="card">
+          <h2>Last night</h2>
+          <p className="desc">
+            Times rather than a total — you remember when you went up far better than you can do
+            the subtraction at half seven. The hours are worked out from them.
+          </p>
+          <div className="grid2">
+            <label className="f">
+              <span className="lab">Went to bed</span>
+              <input type="time" name="bed_at" defaultValue={existing?.bed_at ?? ''} />
+            </label>
+            <label className="f">
+              <span className="lab">Fell asleep (roughly)</span>
+              <input type="time" name="asleep_at" defaultValue={existing?.asleep_at ?? ''} />
+            </label>
+          </div>
+          <div className="grid2">
+            <label className="f">
+              <span className="lab">Woke up</span>
+              <input type="time" name="woke_at" defaultValue={existing?.woke_at ?? ''} />
+            </label>
+            <label className="f">
+              <span className="lab">Got out of bed</span>
+              <input type="time" name="up_at" defaultValue={existing?.up_at ?? ''} />
+            </label>
+          </div>
+          <label className="f" style={{ marginBottom: 0 }}>
+            <span className="lab">Or just the total, in hours</span>
+            <input type="number" step="any" name="sleep_h" inputMode="decimal"
+              defaultValue={existing?.sleep_h ?? ''} placeholder="8.25" />
+          </label>
         </div>
 
-        <form action={saveCheckInAction} className="card">
-          <input type="hidden" name="day" value={day} />
+        {/* ------------------------------------------------------ how you are */}
+        <div className="card">
+          <h2>How you are</h2>
+          <p className="desc">First instinct. Thinking about it does not make it more accurate.</p>
+          <Ten name="rested" label="Restedness" low="Wrecked" high="Fully rested" value={existing?.rested} />
+          <Ten name="energy" label="Energy" low="Flat" high="Buzzing" value={existing?.energy} />
+          <Ten name="soreness" label="Muscle soreness" low="None" high="Very sore" value={existing?.soreness} />
+          <Ten name="stress10" label="Stress" low="Calm" high="Fried" value={existing?.stress ? existing.stress * 2 : null} />
+          <Ten name="motivation10" label="Motivation" low="Can't face it" high="Keen" value={existing?.motivation ? existing.motivation * 2 : null} />
+        </div>
 
-          <label className="f">
-            <span className="lab">Morning weight (kg) — fasted, after the loo, before anything else</span>
-            <input
-              type="number" step="any" name="weight_kg" inputMode="decimal"
-              defaultValue={existing?.weight_kg ?? ''} placeholder={String(s.weight_kg)}
-            />
-          </label>
-
-          <Choice name="energy" label="Energy" options={['low', 'normal', 'high']} value={existing?.energy ?? null} />
-          <Choice name="hunger" label="Hunger" options={['low', 'normal', 'high']} value={existing?.hunger ?? null}
-            help="Genuinely useful. Persistent high hunger with a flat weight trend is the clearest signal there is that the calorie target is too low." />
-          <Choice name="body" label="Legs and body" options={['good', 'normal', 'sore']} value={existing?.body ?? null} />
-          <Choice name="session_feel" label="How training felt" options={['poor', 'normal', 'excellent']} value={existing?.session_feel ?? null} />
-          <Choice name="training_done" label="Training completed" options={['all', 'most', 'some', 'none']} value={existing?.training_done ?? null} />
-          <Choice name="bowel" label="Bowels" options={['none', 'normal', 'loose', 'hard']} value={existing?.bowel ?? null}
-            help="Not a delicate question — it is the fastest read on fibre, hydration and whether the training fuel is agreeing with you." />
-          <Choice name="digestion" label="Digestion" options={['fine', 'bloated', 'cramping']} value={existing?.digestion ?? null} />
-
-          {s.sleep_mode === 'objective' ? (
-            <label className="f">
-              <span className="lab">Sleep (hours)</span>
-              <input type="number" step="any" name="sleep_h" inputMode="decimal" defaultValue={existing?.sleep_h ?? ''} />
+        {/* -------------------------------------------------------- last night */}
+        <div className="card">
+          <h2>Yesterday and last night</h2>
+          <div className="row" style={{ marginBottom: 14 }}>
+            <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <input type="checkbox" name="alcohol" defaultChecked={existing?.alcohol ?? false} />
+              <span className="small">Had a drink</span>
             </label>
-          ) : (
-            <Choice name="sleep_note" label="Sleep" options={['poor', 'average', 'good']} value={existing?.sleep_note ?? null}
-              help="Subjective for now. When you have a watch or ring worth trusting, switch this to hours in Settings and the engine uses that instead." />
-          )}
-
-          <label className="f">
-            <span className="lab">Anything else</span>
-            <textarea name="note" defaultValue={existing?.note ?? ''} rows={2} />
-          </label>
-
-          <button className="wide" type="submit">{existing ? 'Update' : 'Save'}</button>
-        </form>
-
-        {recent.length > 1 && (
-          <div className="card" style={{ padding: 0 }}>
-            <div className="scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th style={{ paddingLeft: 12 }}>Day</th><th>Weight</th><th>Energy</th>
-                    <th>Hunger</th><th>Bowels</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recent.map((c) => (
-                    <tr key={c.day}>
-                      <td className="k" style={{ paddingLeft: 12 }}>{labelFor(c.day)}</td>
-                      <td className="num">{c.weight_kg ?? '—'}</td>
-                      <td className="muted">{c.energy ?? '—'}</td>
-                      <td className="muted">{c.hunger ?? '—'}</td>
-                      <td className="muted">{c.bowel ?? '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              <input type="checkbox" name="late_caffeine" defaultChecked={existing?.late_caffeine ?? false} />
+              <span className="small">Late caffeine</span>
+            </label>
           </div>
-        )}
-      </div>
-      <Nav active="/fuel" />
-    </>
+          <label className="f">
+            <span className="lab">Training yesterday</span>
+            <input type="text" name="trained_yday" defaultValue={existing?.trained_yday ?? ''}
+              placeholder="Lower A, plus a walk" />
+          </label>
+          <label className="f" style={{ marginBottom: 0 }}>
+            <span className="lab">Planned training today</span>
+            <input type="text" name="planned_today" defaultValue={existing?.planned_today ?? ''}
+              placeholder="Gates at Aldershot" />
+          </label>
+        </div>
+
+        {/* ---------------------------------------------------------- extras */}
+        <details className="card">
+          <summary><h2>Numbers and anything unusual</h2></summary>
+          <p className="desc" style={{ marginTop: 12 }}>
+            All optional. Resting heart rate is the single most useful of them — it is measured
+            against your own fortnight, not a population, so it only starts saying anything after
+            a couple of weeks of entries.
+          </p>
+          <div className="grid2">
+            <label className="f">
+              <span className="lab">Resting HR</span>
+              <input type="number" name="rhr" inputMode="numeric" defaultValue={existing?.rhr ?? ''} />
+            </label>
+            <label className="f">
+              <span className="lab">Weight (kg)</span>
+              <input type="number" step="any" name="weight_kg" inputMode="decimal"
+                defaultValue={existing?.weight_kg ?? ''} placeholder={settings.weight_kg.toFixed(1)} />
+            </label>
+          </div>
+          <label className="f">
+            <span className="lab">Pain or body issues</span>
+            <input type="text" name="pain_note" defaultValue={existing?.pain_note ?? ''}
+              placeholder="Left knee a bit stiff on the stairs" />
+          </label>
+          <label className="f">
+            <span className="lab">Anything unusual</span>
+            <input type="text" name="unusual" defaultValue={existing?.unusual ?? ''} />
+          </label>
+          <label className="f" style={{ marginBottom: 0, display: 'flex', gap: 10, alignItems: 'center' }}>
+            <input type="checkbox" name="illness" defaultChecked={existing?.illness ?? false} style={{ width: 20 }} />
+            <span className="small">Unwell today</span>
+          </label>
+        </details>
+
+        <button className="wide" type="submit">
+          {done ? 'Save changes' : 'Start the day'}
+        </button>
+        <p className="xs center" style={{ marginTop: 12 }}>
+          None of this is a medical measurement. It is a consistent way of asking the same
+          questions every morning so the trend means something.
+        </p>
+      </form>
+
+      <Nav active="/" />
+    </div>
   );
 }

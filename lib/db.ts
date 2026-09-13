@@ -1,5 +1,11 @@
 import postgres from 'postgres';
 
+import type { Readiness } from './readiness';
+import type { KneeLog } from './knee';
+import type { Job } from './work';
+import type { WorkSlot } from './week';
+
+
 type Sql = ReturnType<typeof postgres>;
 
 declare global {
@@ -86,96 +92,82 @@ export const sql = new Proxy((() => {}) as unknown as Sql, {
   },
 }) as Sql;
 
+
 /* ------------------------------------------------------------------ types */
 
 export type Settings = {
   id: number;
-  athlete_name: string;
-  race_date: string;      // ISO date of the A race
-  start_date: string;     // ISO date of programme week 1, Monday
+  name: string;
+  champs_date: string;
+  surgery_date: string;
+  start_date: string;
   weight_kg: number;
-  ftp: number | null;
-  css_sec: number | null;         // seconds per 100 m
-  five_k_sec: number | null;      // seconds
-  lthr_run: number | null;
-  lthr_bike: number | null;
-  bench_5rm: number | null;
-  aero_bars: boolean;
-  transitions_rehearsed: boolean;
-  badminton_fri: boolean;
-  badminton_sun: boolean;
+  handicap: number | null;
+  rpm_hours: number;
   updated_at: string;
 
-  /* --- added by the nutrition engine -------------------------------- */
-  height_cm: number;
-  age_years: number;
-  sex: 'male' | 'female';
-  body_fat_pct: number | null;
-  /** 25 m. Explicit, so nothing in the app can assume otherwise again. */
-  pool_length_m: number;
-  budget_gbp: number;
-  /** Multiplier on resting metabolism for a day with NO training in it. */
-  neat_pal: number;
-  /** Standing calorie adjustment from the weekly weight trend. */
-  kcal_adjust: number;
-  sleep_mode: 'subjective' | 'objective';
-  /** Grams of carbohydrate an hour the gut currently handles. */
-  carb_tolerance: number;
-  meals_per_day: number;
+  /* --- the day frame the planner works inside ---------------------- */
   wake_time: string;
   bed_time: string;
-  am_time: string;
-  pm_time: string;
-  eve_time: string;
-};
-
-export type Readiness = {
-  day: string;
-  sleep_h: number | null;
-  sleep_q: number | null;
-  rhr: number | null;
-  hrv: number | null;
-  weight_kg: number | null;
-  fatigue: number | null;
-  soreness: number | null;
-  stress: number | null;
-  motivation: number | null;
-  illness: boolean;
-  pain: string | null;
-  notes: string | null;
-  score: number | null;
-  band: 'green' | 'amber' | 'red' | null;
+  sleep_target_h: number;
+  /** Hours of RPM a normal working day owes — a budget, not a fixed block. */
+  rpm_daily_h: number;
+  /** Past this, more work makes the day worse rather than better. */
+  work_cap_h: number;
+  /** Minutes of unstructured time the day has to keep. */
+  free_floor_min: number;
+  obarts_points: number | null;
+  golf_handicap: number | null;
 };
 
 export type SessionRow = {
   id: number;
   day: string;
-  discipline: 'SW' | 'BK' | 'RN' | 'ST' | 'OT' | 'BR';
-  plan_key: string | null;
+  kind: string;
+  gym_day: string | null;
   title: string | null;
   duration_min: number | null;
-  distance: number | null;
   rpe: number | null;
-  avg_hr: number | null;
-  avg_power: number | null;
-  np: number | null;
-  cadence: number | null;
-  avg_pace_sec: number | null;
-  stroke_count: number | null;
-  hr_drift: number | null;
-  carbs_per_h: number | null;
-  niggle: string | null;
+  detail: string | null;
   notes: string | null;
   completed: boolean;
-  created_at: string;
+};
+
+export type Lift = {
+  id: number;
+  day: string;
+  exercise: string;
+  load_kg: number | null;
+  reps: number | null;
+  sets: number | null;
+  side: string | null;
+  note: string | null;
+};
+
+export type LsiRow = {
+  id: number;
+  day: string;
+  test: string;
+  left_val: number;
+  right_val: number;
+  lsi: number;
+  note: string | null;
+};
+
+export type WorkLogRow = {
+  id: number;
+  day: string;
+  job_id: number | null;
+  minutes: number;
+  note: string | null;
 };
 
 /* ------------------------------------------------------------- accessors */
 
 /**
- * Every date in this app is a calendar day, never an instant. The driver hands
- * DATE columns back as Date objects, which reintroduces a timezone the data has
- * not got — and that is how you end up prescribing Tuesday's session on Monday.
+ * Every date here is a calendar day, never an instant. The driver hands DATE
+ * columns back as Date objects, which reintroduces a timezone the data has not
+ * got — and that is how Wednesday's gates session ends up on a Tuesday.
  * Normalise to 'YYYY-MM-DD' on the way out, once, here.
  */
 function dstr(v: unknown): string {
@@ -186,37 +178,72 @@ function dstr(v: unknown): string {
   return String(v ?? '').slice(0, 10);
 }
 
+function dnull(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  return dstr(v);
+}
+
+/** postgres.js returns numeric columns as strings. Nothing good comes of that. */
+function n(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const x = Number(v);
+  return Number.isFinite(x) ? x : null;
+}
+
 export async function getSettings(): Promise<Settings> {
   const rows = await sql<Settings[]>`select * from settings where id = 1`;
-  if (!rows[0]) throw new Error('Settings row missing. Run the setup script: scripts/init-db.mjs');
+  if (!rows[0]) throw new Error('Settings row missing — run the setup SQL.');
   const s = rows[0];
   return {
     ...s,
-    race_date: dstr(s.race_date),
+    champs_date: dstr(s.champs_date),
+    surgery_date: dstr(s.surgery_date),
     start_date: dstr(s.start_date),
-    weight_kg: Number(s.weight_kg),
-    height_cm: Number(s.height_cm ?? 177),
-    age_years: Number(s.age_years ?? 18),
-    body_fat_pct: s.body_fat_pct == null ? null : Number(s.body_fat_pct),
-    pool_length_m: Number(s.pool_length_m ?? 25),
-    budget_gbp: Number(s.budget_gbp ?? 60),
-    neat_pal: Number(s.neat_pal ?? 1.40),
-    kcal_adjust: Number(s.kcal_adjust ?? 0),
-    carb_tolerance: Number(s.carb_tolerance ?? 45),
-    meals_per_day: Number(s.meals_per_day ?? 3),
+    weight_kg: n(s.weight_kg) ?? 70,
+    handicap: n(s.handicap),
+    wake_time: s.wake_time ?? '07:30',
+    bed_time: s.bed_time ?? '23:15',
+    sleep_target_h: n(s.sleep_target_h) ?? 8.25,
+    rpm_daily_h: n(s.rpm_daily_h) ?? 7,
+    work_cap_h: n(s.work_cap_h) ?? 9,
+    free_floor_min: Number(s.free_floor_min ?? 120),
+    obarts_points: n(s.obarts_points),
+    golf_handicap: n(s.golf_handicap),
   };
 }
 
 export async function getReadiness(day: string): Promise<Readiness | null> {
   const rows = await sql<Readiness[]>`select * from readiness where day = ${day}`;
+  return rows[0] ? { ...rows[0], day: dstr(rows[0].day), sleep_h: n(rows[0].sleep_h), weight_kg: n(rows[0].weight_kg) } : null;
+}
+
+export async function recentReadiness(day: string, limit = 28): Promise<Readiness[]> {
+  const rows = await sql<Readiness[]>`
+    select * from readiness where day <= ${day} order by day desc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), sleep_h: n(r.sleep_h), weight_kg: n(r.weight_kg) }));
+}
+
+export async function weightSeries(limit = 120): Promise<{ day: string; weight_kg: number }[]> {
+  const rows = await sql<{ day: string; weight_kg: number }[]>`
+    select day, weight_kg from readiness
+    where weight_kg is not null order by day asc limit ${limit}`;
+  return rows.map((r) => ({ day: dstr(r.day), weight_kg: n(r.weight_kg) ?? 0 }));
+}
+
+export async function recentKnee(day: string, limit = 40): Promise<KneeLog[]> {
+  const rows = await sql<KneeLog[]>`
+    select * from knee_log where day <= ${day} order by day desc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day) }));
+}
+
+export async function getKnee(day: string): Promise<KneeLog | null> {
+  const rows = await sql<KneeLog[]>`select * from knee_log where day = ${day}`;
   return rows[0] ? { ...rows[0], day: dstr(rows[0].day) } : null;
 }
 
-/** Most recent N readiness rows on or before `day`, newest first. */
-export async function recentReadiness(day: string, n = 21): Promise<Readiness[]> {
-  const rows = await sql<Readiness[]>`
-    select * from readiness where day <= ${day} order by day desc limit ${n}`;
-  return rows.map((r) => ({ ...r, day: dstr(r.day) }));
+export async function lsiRows(limit = 60): Promise<LsiRow[]> {
+  const rows = await sql<LsiRow[]>`select * from lsi_tests order by day desc, test asc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), left_val: n(r.left_val) ?? 0, right_val: n(r.right_val) ?? 0, lsi: n(r.lsi) ?? 0 }));
 }
 
 export async function sessionsBetween(from: string, to: string): Promise<SessionRow[]> {
@@ -225,135 +252,321 @@ export async function sessionsBetween(from: string, to: string): Promise<Session
   return rows.map((r) => ({ ...r, day: dstr(r.day) }));
 }
 
-export async function sessionsOn(day: string): Promise<SessionRow[]> {
-  const rows = await sql<SessionRow[]>`select * from sessions where day = ${day} order by id asc`;
+export async function recentSessions(limit = 30): Promise<SessionRow[]> {
+  const rows = await sql<SessionRow[]>`select * from sessions order by day desc, id desc limit ${limit}`;
   return rows.map((r) => ({ ...r, day: dstr(r.day) }));
 }
 
-/* ==================================================================
-   NUTRITION ACCESSORS
-   These read the same tables the training engine writes to wherever
-   they can; nothing about a session is stored twice.
-   ================================================================== */
-
-export type OtherActivityRow = {
-  id: number;
-  day: string;
-  activity: string;
-  duration_min: number;
-  rpe: number | null;
-  factor: number;
-  next_day: string | null;
-};
-
-export type CheckIn = {
-  day: string;
-  weight_kg: number | null;
-  energy: string | null;
-  hunger: string | null;
-  body: string | null;
-  session_feel: string | null;
-  bowel: string | null;
-  digestion: string | null;
-  sleep_note: string | null;
-  sleep_h: number | null;
-  training_done: string | null;
-  note: string | null;
-};
-
-export type FoodPrefRow = {
-  id: number;
-  food_key: string | null;
-  raw: string;
-  stance: string;
-  note: string | null;
-};
-
-export type MealPrefRow = { meal_key: string; stance: string; note: string | null };
-export type RestrictionRow = { id: number; name: string; kind: string; severity: string };
-export type ToleranceRowDb = {
-  id: number; day: string; session_ref: string | null;
-  duration_min: number | null; carbs_per_h: number; gi_ok: boolean; note: string | null;
-};
-export type IntakeRow = {
-  id: number; day: string; raw: string; slot: string | null;
-  kcal: number; protein_g: number; carb_g: number; fat_g: number; fibre_g: number;
-};
-export type NutritionChange = {
-  id: number; day: string; what: string; why: string; delta_kcal: number | null; automatic: boolean;
-};
-
-export async function otherOn(day: string): Promise<OtherActivityRow[]> {
-  const rows = await sql<OtherActivityRow[]>`select * from other_activity where day = ${day} order by id`;
-  return rows.map((r) => ({ ...r, day: dstr(r.day), factor: Number(r.factor) }));
+export async function recentLifts(limit = 40): Promise<Lift[]> {
+  const rows = await sql<Lift[]>`select * from lifts order by day desc, id desc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), load_kg: n(r.load_kg) }));
 }
 
-export async function otherBetween(from: string, to: string): Promise<OtherActivityRow[]> {
-  const rows = await sql<OtherActivityRow[]>`
-    select * from other_activity where day >= ${from} and day <= ${to} order by day, id`;
-  return rows.map((r) => ({ ...r, day: dstr(r.day), factor: Number(r.factor) }));
+export async function ticksFor(week: number): Promise<Record<string, boolean>> {
+  const rows = await sql<{ task: string; done: boolean }[]>`
+    select task, done from week_ticks where week = ${week}`;
+  const out: Record<string, boolean> = {};
+  for (const r of rows) out[r.task] = r.done;
+  return out;
 }
 
-export async function getCheckIn(day: string): Promise<CheckIn | null> {
-  const rows = await sql<CheckIn[]>`select * from checkins where day = ${day}`;
-  return rows[0] ? { ...rows[0], day: dstr(rows[0].day), weight_kg: rows[0].weight_kg == null ? null : Number(rows[0].weight_kg), sleep_h: rows[0].sleep_h == null ? null : Number(rows[0].sleep_h) } : null;
+export async function allJobs(): Promise<Job[]> {
+  const rows = await sql<Job[]>`
+    select * from jobs where status <> 'done' order by created_at asc, id asc`;
+  return rows.map((r) => ({
+    ...r,
+    due: dnull(r.due),
+    last_touched: dnull(r.last_touched),
+    created_at: dstr(r.created_at),
+    value_gbp: n(r.value_gbp),
+  }));
 }
 
-export async function recentCheckIns(day: string, n = 30): Promise<CheckIn[]> {
-  const rows = await sql<CheckIn[]>`select * from checkins where day <= ${day} order by day desc limit ${n}`;
-  return rows.map((r) => ({ ...r, day: dstr(r.day), weight_kg: r.weight_kg == null ? null : Number(r.weight_kg), sleep_h: r.sleep_h == null ? null : Number(r.sleep_h) }));
+export async function doneJobs(limit = 40): Promise<Job[]> {
+  const rows = await sql<Job[]>`
+    select * from jobs where status = 'done' order by done_at desc nulls last, id desc limit ${limit}`;
+  return rows.map((r) => ({
+    ...r,
+    due: dnull(r.due),
+    last_touched: dnull(r.last_touched),
+    created_at: dstr(r.created_at),
+    value_gbp: n(r.value_gbp),
+  }));
+}
+
+export async function getSlots(): Promise<WorkSlot[]> {
+  const rows = await sql<WorkSlot[]>`select weekday, time, minutes, label, protected from work_slots order by weekday, time`;
+  return rows;
+}
+
+export async function workLogBetween(from: string, to: string): Promise<WorkLogRow[]> {
+  const rows = await sql<WorkLogRow[]>`
+    select * from work_log where day >= ${from} and day <= ${to} order by day asc, id asc`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day) }));
+}
+
+/* ===================================================================
+ *  The performance OS.
+ *
+ *  Calendar, planner, goals, and the tracking areas. Same conventions
+ *  as everything above: dates come back as 'YYYY-MM-DD' strings, and
+ *  numerics come back as numbers rather than the strings the driver
+ *  hands over.
+ * =================================================================== */
+
+import type { CalEvent, Commitment, Block } from './planner';
+import type { Goal, Milestone } from './goals';
+import type { SkiRace, SkiRun } from './ski';
+
+/* ---------------------------------------------------------- calendar */
+
+export async function eventsBetween(from: string, to: string): Promise<CalEvent[]> {
+  const rows = await sql<CalEvent[]>`
+    select * from calendar_events
+    where day <= ${to} and coalesce(end_day, day) >= ${from}
+    order by day asc, start_at asc nulls first`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), end_day: r.end_day ? dstr(r.end_day) : null }));
+}
+
+export async function eventsOn(day: string): Promise<CalEvent[]> {
+  return eventsBetween(day, day);
+}
+
+export async function nextEvents(from: string, limit = 8): Promise<CalEvent[]> {
+  const rows = await sql<CalEvent[]>`
+    select * from calendar_events
+    where coalesce(end_day, day) >= ${from}
+    order by day asc, start_at asc nulls first
+    limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), end_day: r.end_day ? dstr(r.end_day) : null }));
+}
+
+export async function getCommitments(): Promise<Commitment[]> {
+  return sql<Commitment[]>`select * from commitments where active order by weekday, start_at`;
+}
+
+/* ----------------------------------------------------------- planner */
+
+type BlockRow = {
+  id: number; day: string; start_at: string; end_at: string; kind: string;
+  title: string; detail: string | null; why: string | null;
+  job_id: number | null; event_id: number | null; goal_id: number | null;
+  locked: boolean; status: string; generated: boolean;
+};
+
+function toMinutes(t: string): number {
+  const m = /^(\d{1,2}):(\d{2})/.exec(t ?? '');
+  return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
+}
+function toClock(mins: number): string {
+  const t = ((Math.round(mins) % 1440) + 1440) % 1440;
+  return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+}
+
+export type StoredBlock = Block & { id: number };
+
+export async function blocksOn(day: string): Promise<StoredBlock[]> {
+  const rows = await sql<BlockRow[]>`
+    select * from plan_blocks where day = ${day} order by start_at asc`;
+  return rows.map((r) => ({
+    id: r.id,
+    start: toMinutes(r.start_at),
+    end: toMinutes(r.end_at),
+    kind: r.kind as Block['kind'],
+    title: r.title,
+    detail: r.detail,
+    why: r.why,
+    jobId: r.job_id,
+    eventId: r.event_id,
+    goalId: r.goal_id,
+    locked: r.locked,
+    status: r.status as Block['status'],
+    generated: r.generated,
+  }));
 }
 
 /**
- * Every weigh-in available, oldest first, from BOTH the readiness check-in and
- * the nutrition check-in. They are two forms onto one fact, and the trend
- * engine should not care which one was used on a given morning.
+ * Write a generated day back, without disturbing anything the athlete
+ * touched. Locked blocks and anything already marked done or skipped
+ * are left exactly where they are — that is the whole contract of
+ * automatic replanning, and breaking it once would end trust in it.
  */
-export async function weightSeries(limitDays = 120): Promise<{ day: string; weight: number }[]> {
-  const rows = await sql<{ day: string; w: string }[]>`
-    select day, max(w)::numeric as w from (
-      select day, weight_kg as w from readiness where weight_kg is not null
-      union all
-      select day, weight_kg as w from checkins  where weight_kg is not null
-    ) both_sources
-    group by day
-    order by day desc
-    limit ${limitDays}`;
-  return rows
-    .map((r) => ({ day: dstr(r.day), weight: Number(r.w) }))
-    .filter((r) => Number.isFinite(r.weight))
-    .reverse();
+export async function saveDay(day: string, blocks: Block[]): Promise<void> {
+  await sql`
+    delete from plan_blocks
+    where day = ${day} and locked = false and status = 'planned' and generated = true`;
+  for (const b of blocks) {
+    if (b.locked) continue;
+    await sql`
+      insert into plan_blocks
+        (day, start_at, end_at, kind, title, detail, why, job_id, event_id, goal_id, locked, status, generated)
+      values
+        (${day}, ${toClock(b.start)}, ${toClock(b.end)}, ${b.kind}, ${b.title},
+         ${b.detail}, ${b.why}, ${b.jobId}, ${b.eventId}, ${b.goalId},
+         ${b.locked}, ${b.status}, ${b.generated})
+      on conflict (day, start_at, title) do nothing`;
+  }
 }
 
-export async function foodPrefs(): Promise<FoodPrefRow[]> {
-  return sql<FoodPrefRow[]>`select id, food_key, raw, stance, note from food_prefs order by created_at desc`;
+/* ------------------------------------------------------------- goals */
+
+export async function allGoals(): Promise<Goal[]> {
+  const rows = await sql<Goal[]>`select * from goals order by sort asc, id asc`;
+  return rows.map((r) => ({
+    ...r,
+    target_date: r.target_date ? dstr(r.target_date) : null,
+    start_value: n(r.start_value),
+    current_value: n(r.current_value),
+    target_value: n(r.target_value),
+  }));
 }
 
-export async function mealPrefs(): Promise<MealPrefRow[]> {
-  return sql<MealPrefRow[]>`select meal_key, stance, note from meal_prefs`;
+export async function allMilestones(): Promise<Milestone[]> {
+  const rows = await sql<Milestone[]>`select * from goal_milestones order by goal_id, sort`;
+  return rows.map((r) => ({ ...r, value: n(r.value), hit_on: r.hit_on ? dstr(r.hit_on) : null }));
 }
 
-export async function restrictions(): Promise<RestrictionRow[]> {
-  return sql<RestrictionRow[]>`select id, name, kind, severity from restrictions order by id`;
+export async function goalHistory(goalId: number, limit = 30): Promise<{ day: string; value: number }[]> {
+  const rows = await sql<{ day: string; value: string }[]>`
+    select day, value from goal_progress where goal_id = ${goalId}
+    order by day desc limit ${limit}`;
+  return rows.map((r) => ({ day: dstr(r.day), value: Number(r.value) }));
 }
 
-export async function toleranceHistory(n = 20): Promise<ToleranceRowDb[]> {
-  const rows = await sql<ToleranceRowDb[]>`select * from fuel_tolerance order by day desc limit ${n}`;
+/* --------------------------------------------------------- ski racing */
+
+export async function skiRaces(limit = 40): Promise<SkiRace[]> {
+  const rows = await sql<SkiRace[]>`select * from ski_races order by day desc limit ${limit}`;
+  return rows.map((r) => ({
+    ...r, day: dstr(r.day),
+    winner_sec: n(r.winner_sec), total_sec: n(r.total_sec), obarts: n(r.obarts),
+  }));
+}
+
+export async function runsForRaces(ids: number[]): Promise<Record<number, SkiRun[]>> {
+  if (!ids.length) return {};
+  const rows = await sql<(SkiRun & { race_id: number })[]>`
+    select * from ski_runs where race_id in ${sql(ids)} order by race_id, run_no`;
+  const out: Record<number, SkiRun[]> = {};
+  for (const r of rows) {
+    (out[r.race_id] ??= []).push({ ...r, time_sec: n(r.time_sec), penalty: n(r.penalty) });
+  }
+  return out;
+}
+
+export type SkiSessionRow = {
+  id: number; day: string; venue: string | null; surface: string; kind: string;
+  duration_min: number | null; runs: number | null; focus: string | null;
+  intensity: number | null; confidence: number | null; notes: string | null;
+};
+
+export async function skiSessions(limit = 40): Promise<SkiSessionRow[]> {
+  const rows = await sql<SkiSessionRow[]>`select * from ski_sessions order by day desc limit ${limit}`;
   return rows.map((r) => ({ ...r, day: dstr(r.day) }));
 }
 
-export async function intakeOn(day: string): Promise<IntakeRow[]> {
-  const rows = await sql<IntakeRow[]>`select * from intake_log where day = ${day} order by id`;
+/* -------------------------------------------------- golf, brand, money */
+
+export type GolfRound = {
+  id: number; day: string; course: string | null; holes: number;
+  score: number | null; par: number | null; handicap: number | null; notes: string | null;
+};
+
+export async function golfRounds(limit = 40): Promise<GolfRound[]> {
+  const rows = await sql<GolfRound[]>`select * from golf_rounds order by day desc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), handicap: n(r.handicap) }));
+}
+
+export type BrandRow = {
+  day: string; followers: number | null; posts: number | null; reels: number | null;
+  views: number | null; engagement: number | null; minutes: number | null;
+  leads: number | null; revenue_gbp: number | null; notes: string | null;
+};
+
+export async function brandRows(limit = 60): Promise<BrandRow[]> {
+  const rows = await sql<BrandRow[]>`select * from brand_metrics order by day desc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), revenue_gbp: n(r.revenue_gbp) }));
+}
+
+export type MoneyRow = {
+  id: number; day: string; kind: string; category: string | null;
+  label: string | null; amount_gbp: number; notes: string | null;
+};
+
+export async function moneyRows(limit = 120): Promise<MoneyRow[]> {
+  const rows = await sql<MoneyRow[]>`select * from money_entries order by day desc, id desc limit ${limit}`;
+  return rows.map((r) => ({ ...r, day: dstr(r.day), amount_gbp: Number(r.amount_gbp) }));
+}
+
+/* --------------------------------------------------------- day scores */
+
+export type DayScoreRow = {
+  day: string; score: number | null; band: string | null;
+  parts: unknown; confidence: string; note: string | null;
+};
+
+export async function recentScores(day: string, limit = 14): Promise<DayScoreRow[]> {
+  const rows = await sql<DayScoreRow[]>`
+    select * from day_scores where day <= ${day} order by day desc limit ${limit}`;
   return rows.map((r) => ({ ...r, day: dstr(r.day) }));
 }
 
-export async function nutritionChanges(n = 15): Promise<NutritionChange[]> {
-  const rows = await sql<NutritionChange[]>`select * from nutrition_changes order by created_at desc limit ${n}`;
-  return rows.map((r) => ({ ...r, day: dstr(r.day) }));
+export async function saveScore(day: string, score: number | null, band: string | null, parts: unknown, confidence: string, note: string | null): Promise<void> {
+  await sql`
+    insert into day_scores (day, score, band, parts, confidence, note)
+    values (${day}, ${score}, ${band}, ${sql.json(parts as never)}, ${confidence}, ${note})
+    on conflict (day) do update set
+      score = excluded.score, band = excluded.band, parts = excluded.parts,
+      confidence = excluded.confidence, note = excluded.note`;
 }
 
-export async function savedShoppingList(weekStart: string) {
-  const rows = await sql<{ week_start: string; items: unknown; total_gbp: string; actual_gbp: string | null }[]>`
-    select * from shopping_lists where week_start = ${weekStart}`;
-  return rows[0] ?? null;
+/* ------------------------------------------------------ balance signal */
+
+/**
+ * How hard the last week has actually been, and how long since an evening
+ * was genuinely his. Feeds the social-balance recommendation.
+ */
+export async function balanceSignal(day: string): Promise<{
+  workMin7: number; trainMin7: number; freeMin7: number; daysSinceSocial: number;
+}> {
+  const from = dateMinus(day, 6);
+  const [work, train, blocks] = await Promise.all([
+    sql<{ m: string }[]>`select coalesce(sum(minutes),0) as m from work_log where day >= ${from} and day <= ${day}`,
+    sql<{ m: string }[]>`select coalesce(sum(duration_min),0) as m from sessions where day >= ${from} and day <= ${day} and completed`,
+    sql<{ day: string; kind: string; minutes: string }[]>`
+      select day, kind, coalesce(sum(
+        (substring(end_at from 1 for 2)::int * 60 + substring(end_at from 4 for 2)::int)
+        - (substring(start_at from 1 for 2)::int * 60 + substring(start_at from 4 for 2)::int)
+      ), 0) as minutes
+      from plan_blocks
+      where day >= ${dateMinus(day, 20)} and day <= ${day} and kind in ('free','social')
+      group by day, kind order by day desc`,
+  ]);
+
+  const freeMin7 = blocks
+    .filter((b) => b.day && dstr(b.day) >= from)
+    .reduce((a, b) => a + Number(b.minutes), 0);
+
+  // A social evening is one with a social block, or ninety-plus minutes free
+  // after six. Absent any planner history, assume it has been a while — which
+  // errs towards suggesting a night off, and that is the safer error.
+  let daysSinceSocial = 99;
+  for (const b of blocks) {
+    if (b.kind !== 'social' && Number(b.minutes) < 90) continue;
+    const d = Math.round((new Date(dstr(b.day) + 'T12:00:00Z').getTime() - new Date(day + 'T12:00:00Z').getTime()) / -86400000);
+    if (d >= 0 && d < daysSinceSocial) daysSinceSocial = d;
+  }
+
+  return {
+    workMin7: Number(work[0]?.m ?? 0),
+    trainMin7: Number(train[0]?.m ?? 0),
+    freeMin7,
+    daysSinceSocial: daysSinceSocial === 99 ? 7 : daysSinceSocial,
+  };
+}
+
+function dateMinus(iso: string, n2: number): string {
+  const d = new Date(iso + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() - n2);
+  return d.toISOString().slice(0, 10);
 }

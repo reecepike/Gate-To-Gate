@@ -1,164 +1,234 @@
-import type { Readiness } from './db';
-
 /**
- * The readiness engine.
+ * Daily readiness, scored against your own rolling baseline rather than against
+ * a population. An RHR of 54 means nothing on its own; 54 when your fortnight
+ * has been running at 47 means a great deal.
  *
- * Scores deviation from the athlete's OWN 14-day rolling baseline, not from
- * absolute values, and weights trend above any single day. A traffic light
- * built on absolutes would be easy and almost useless.
+ * The trend outranks any single day. One bad morning is a bad morning.
  */
 
-export type Band = 'green' | 'amber' | 'red';
+import { daysBetween } from './plan';
+
+export type Readiness = {
+  day: string;
+  sleep_h: number | null;
+  sleep_q: number | null;       // 1 poor – 5 excellent
+  rhr: number | null;
+  weight_kg: number | null;
+  legs: number | null;          // 1 wrecked – 5 fresh
+  stress: number | null;        // 1 calm – 5 fried
+  motivation: number | null;    // 1 flat – 5 keen
+  work_load: number | null;     // 1 quiet – 5 buried  (RPM + own businesses)
+  illness: boolean;
+  notes: string | null;
+  score: number | null;
+  band: 'green' | 'amber' | 'red' | null;
+
+  /* --- the fuller morning check-in. All optional: every historical row
+         predates them, and a row without them still scores. ------------- */
+  bed_at?: string | null;
+  asleep_at?: string | null;
+  woke_at?: string | null;
+  up_at?: string | null;
+  rested?: number | null;       // 1–10
+  energy?: number | null;       // 1–10
+  soreness?: number | null;     // 1–10, higher is worse
+  pain_note?: string | null;
+  unusual?: string | null;
+  trained_yday?: string | null;
+  alcohol?: boolean;
+  late_caffeine?: boolean;
+  planned_today?: string | null;
+  checked_in_at?: string | null;
+};
+
+/**
+ * Hours between falling asleep and waking.
+ *
+ * Entered times beat an entered total, because people are much better at
+ * remembering when they went to bed than at doing the subtraction at 07:30.
+ * Crossing midnight is the normal case, not the exception.
+ */
+export function sleepHoursFrom(r: Pick<Readiness, 'asleep_at' | 'woke_at' | 'bed_at' | 'up_at' | 'sleep_h'>): number | null {
+  const mins = (t: string | null | undefined): number | null => {
+    if (!t) return null;
+    const m = /^(\d{1,2}):(\d{2})/.exec(t.trim());
+    return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+  };
+  const from = mins(r.asleep_at) ?? mins(r.bed_at);
+  const to = mins(r.woke_at) ?? mins(r.up_at);
+  if (from == null || to == null) return r.sleep_h ?? null;
+  const span = to >= from ? to - from : to + 24 * 60 - from;
+  if (span <= 0 || span > 16 * 60) return r.sleep_h ?? null;
+  return Math.round((span / 60) * 100) / 100;
+}
+
+/** 1–10 → 0–1, optionally inverted for scales where high is bad. */
+function fromTen(v: number | null | undefined, invert = false): number | null {
+  if (v == null) return null;
+  const n = (clamp(v, 1, 10) - 1) / 9;
+  return invert ? 1 - n : n;
+}
 
 export type Verdict = {
   score: number;
-  band: Band;
-  reasons: string[];      // what actually moved the score
-  override: string | null; // a hard stop that ignores the score entirely
-  consecutiveAmber: number;
-  consecutiveRed: number;
+  band: 'green' | 'amber' | 'red';
+  headline: string;
+  drivers: string[];
+  /** What today's training should actually do. */
+  action: string;
 };
 
-const WEIGHTS = {
-  hrv: 25,
-  rhr: 20,
-  sleep: 20,
-  fatigue: 20,
-  stress: 10,
-  weight: 5,
-} as const;
-
-function mean(xs: number[]): number {
-  return xs.reduce((a, b) => a + b, 0) / xs.length;
+function mean(xs: number[]): number | null {
+  const v = xs.filter((x) => Number.isFinite(x));
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
 }
 
-function sd(xs: number[]): number {
-  if (xs.length < 2) return 0;
-  const m = mean(xs);
-  return Math.sqrt(mean(xs.map((x) => (x - m) ** 2)));
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, x));
 }
 
-function series(history: Readiness[], pick: (r: Readiness) => number | null): number[] {
-  return history
-    .map(pick)
-    .filter((v): v is number => v !== null && v !== undefined && Number.isFinite(Number(v)))
-    .map(Number);
+/** 0–1 from a 1–5 scale, where 5 is good. */
+function fromScale(v: number | null, invert = false): number | null {
+  if (v === null) return null;
+  const n = (clamp(v, 1, 5) - 1) / 4;
+  return invert ? 1 - n : n;
 }
 
-/**
- * @param today   today's check-in
- * @param history previous entries, newest first, NOT including today
- */
 export function assess(today: Readiness, history: Readiness[]): Verdict {
-  const base = history.slice(0, 14);
-  const reasons: string[] = [];
-  let penalty = 0;
-  let availableWeight = 0;
+  const past = history.filter((r) => r.day < today.day && daysBetween(r.day, today.day) <= 21).slice(0, 14);
 
-  const use = (w: number) => { availableWeight += w; };
+  const parts: { key: string; weight: number; value: number; note: string | null }[] = [];
 
-  // --- HRV: deviation in standard deviations
-  const hrvs = series(base, (r) => r.hrv);
-  if (today.hrv != null && hrvs.length >= 5) {
-    use(WEIGHTS.hrv);
-    const m = mean(hrvs), s = sd(hrvs) || 1;
-    const z = (Number(today.hrv) - m) / s;
-    if (z <= -2) { penalty += WEIGHTS.hrv; reasons.push(`HRV ${today.hrv} is more than 2 SD below your baseline of ${Math.round(m)}`); }
-    else if (z <= -1) { penalty += WEIGHTS.hrv * 0.5; reasons.push(`HRV ${today.hrv} is below your baseline of ${Math.round(m)}`); }
-  }
-
-  // --- Resting HR
-  const rhrs = series(base, (r) => r.rhr);
-  if (today.rhr != null && rhrs.length >= 5) {
-    use(WEIGHTS.rhr);
-    const m = mean(rhrs);
-    const d = Number(today.rhr) - m;
-    if (d >= 5) { penalty += WEIGHTS.rhr; reasons.push(`Resting HR is ${d.toFixed(0)} bpm above your baseline of ${Math.round(m)}`); }
-    else if (d >= 3) { penalty += WEIGHTS.rhr * 0.5; reasons.push(`Resting HR is drifting up (+${d.toFixed(0)} bpm)`); }
-  }
-
-  // --- Sleep debt over the trailing three nights, against 8 h
-  const nights = [today.sleep_h, ...base.slice(0, 2).map((r) => r.sleep_h)]
-    .filter((v): v is number => v != null)
-    .map(Number);
-  if (nights.length) {
-    use(WEIGHTS.sleep);
-    const debt = nights.reduce((acc, h) => acc + Math.max(0, 8 - h), 0);
-    if (debt >= 3) { penalty += WEIGHTS.sleep; reasons.push(`${debt.toFixed(1)} h of sleep debt over the last ${nights.length} night${nights.length > 1 ? 's' : ''}`); }
-    else if (debt >= 1.5) { penalty += WEIGHTS.sleep * 0.5; reasons.push(`${debt.toFixed(1)} h of sleep debt building`); }
-  }
-
-  // --- Fatigue + soreness against personal average
-  const fat = series(base, (r) => (r.fatigue ?? 0) + (r.soreness ?? 0));
-  if (today.fatigue != null && today.soreness != null) {
-    use(WEIGHTS.fatigue);
-    const now = today.fatigue + today.soreness;
-    const m = fat.length >= 5 ? mean(fat) : 4;
-    if (now >= m + 3) { penalty += WEIGHTS.fatigue; reasons.push('Fatigue and soreness are well above your normal'); }
-    else if (now >= m + 1.5) { penalty += WEIGHTS.fatigue * 0.5; reasons.push('Fatigue and soreness are above your normal'); }
-  }
-
-  // --- Stress + motivation. Low motivation alone is not a red flag.
-  if (today.stress != null && today.motivation != null) {
-    use(WEIGHTS.stress);
-    const strain = today.stress + (6 - today.motivation);
-    if (strain >= 8) { penalty += WEIGHTS.stress; reasons.push('High stress with low motivation'); }
-    else if (strain >= 6) { penalty += WEIGHTS.stress * 0.5; }
-  }
-
-  // --- Bodyweight: a sharp drop is usually fuelling or illness
-  const ws = series(base.slice(0, 7), (r) => r.weight_kg);
-  if (today.weight_kg != null && ws.length >= 4) {
-    use(WEIGHTS.weight);
-    const m = mean(ws);
-    if ((m - Number(today.weight_kg)) / m > 0.015) {
-      penalty += WEIGHTS.weight;
-      reasons.push('Bodyweight has dropped more than 1.5% in a week — check fuelling');
+  /* sleep — 25 */
+  {
+    const base = mean(past.map((r) => sleepHoursFrom(r) ?? NaN)) ?? 8.4;
+    const h = sleepHoursFrom(today);
+    // Quality can come from the old 1–5 field or the new 1–10 restedness one.
+    const q = fromTen(today.rested) ?? fromScale(today.sleep_q);
+    let v = 0.6;
+    let note: string | null = null;
+    if (h !== null) {
+      // 8.4 h is the plan's average and the input the whole build rests on.
+      const dev = h - Math.max(base, 7.5);
+      v = clamp(0.75 + dev * 0.25, 0, 1);
+      if (h < 6.5) note = `${h} h — short. The seven kilos are built in bed, not in the gym.`;
+      else if (h >= 8.5) note = `${h} h — that is the input that makes the rest work.`;
     }
+    if (q !== null) v = v * 0.7 + q * 0.3;
+
+    // Two things that reliably wreck sleep quality without shortening it, and
+    // that the athlete already knows about by the time he is filling this in.
+    if (today.alcohol) {
+      v *= 0.88;
+      note = note ?? 'Drink last night. Total time is usually fine; the second half of the night is not.';
+    }
+    if (today.late_caffeine) {
+      v *= 0.94;
+      note = note ?? 'Late caffeine. Half of it is still in you six hours later.';
+    }
+    parts.push({ key: 'Sleep', weight: 25, value: v, note });
   }
 
-  // Redistribute the weight of anything missing, so a day without HRV still scores.
-  const total = availableWeight || 1;
-  const score = Math.round(Math.max(0, Math.min(100, 100 - (penalty / total) * 100)));
-
-  let band: Band = score >= 80 ? 'green' : score >= 60 ? 'amber' : 'red';
-
-  // --- trend rules: three ambers outrank one green
-  let consecutiveAmber = 0;
-  let consecutiveRed = 0;
-  for (const r of history) {
-    if (r.band === 'amber') consecutiveAmber++;
-    else break;
-  }
-  for (const r of history) {
-    if (r.band === 'red') consecutiveRed++;
-    else break;
-  }
-  if (band === 'amber' && consecutiveAmber >= 2) {
-    band = 'red';
-    reasons.push('Third amber day in a row — treating this as red. A slow drift is more dangerous than one bad number.');
+  /* resting heart rate — 20 */
+  {
+    const base = mean(past.map((r) => r.rhr ?? NaN));
+    let v = 0.7;
+    let note: string | null = null;
+    if (today.rhr !== null && base !== null) {
+      const dev = today.rhr - base;
+      v = clamp(1 - dev / 12, 0, 1);
+      if (dev >= 7) note = `RHR +${dev.toFixed(0)} on your fortnight. One morning is noise; three in a row is a week to pull back.`;
+      else if (dev <= -3) note = `RHR ${dev.toFixed(0)} on baseline — well recovered.`;
+    } else if (today.rhr !== null) {
+      v = 0.7;
+    }
+    parts.push({ key: 'RHR', weight: 20, value: v, note });
   }
 
-  // --- hard overrides, which ignore the score entirely
-  let override: string | null = null;
+  /* legs — 20 */
+  {
+    // Soreness is the more precise of the two, and it runs the other way.
+    const sore = fromTen(today.soreness, true);
+    const legs = fromScale(today.legs);
+    const v = sore != null && legs != null ? sore * 0.6 + legs * 0.4 : (sore ?? legs ?? 0.65);
+    const note =
+      (today.soreness ?? 0) >= 7
+        ? `Soreness ${today.soreness}/10. Wednesday needs the legs more than Monday does.`
+        : (today.legs ?? 5) <= 2
+          ? 'Legs are flat. Wednesday needs them more than Monday does.'
+          : null;
+    parts.push({ key: 'Legs', weight: 20, value: v, note });
+  }
+
+  /* stress + work load — 15 */
+  {
+    const s = fromScale(today.stress, true);
+    const w = fromScale(today.work_load, true);
+    const v = mean([s, w].filter((x): x is number => x !== null)) ?? 0.65;
+    const note = (today.stress ?? 1) >= 4 || (today.work_load ?? 1) >= 5
+      ? 'Work is loud today. Training load and life load draw on the same account.'
+      : null;
+    parts.push({ key: 'Stress & work', weight: 15, value: v, note });
+  }
+
+  /* motivation and energy — 10 */
+  {
+    const e = fromTen(today.energy);
+    const m = fromScale(today.motivation);
+    const v = e != null && m != null ? e * 0.5 + m * 0.5 : (e ?? m ?? 0.65);
+    const note = (today.motivation ?? 5) <= 2 ? 'Flat. Worth noticing when it lasts more than two days — that is fatigue, not character.' : null;
+    parts.push({ key: 'Motivation', weight: 10, value: v, note });
+  }
+
+  /* bodyweight trend — 10 */
+  {
+    const base = mean(past.map((r) => r.weight_kg ?? NaN));
+    let v = 0.7;
+    let note: string | null = null;
+    if (today.weight_kg !== null && base !== null) {
+      const dev = today.weight_kg - base;
+      // Losing weight on a mass block is the problem, not gaining it.
+      v = dev >= 0 ? 0.85 : clamp(0.85 + dev * 0.6, 0, 1);
+      if (dev <= -0.8) note = `Down ${Math.abs(dev).toFixed(1)} kg on your fortnight. On this block that is under-eating, not over-training.`;
+    }
+    parts.push({ key: 'Bodyweight', weight: 10, value: v, note });
+  }
+
+  const totalW = parts.reduce((a, p) => a + p.weight, 0);
+  let score = Math.round(parts.reduce((a, p) => a + p.value * p.weight, 0) / totalW * 100);
+
+  let band: 'green' | 'amber' | 'red' = score >= 75 ? 'green' : score >= 55 ? 'amber' : 'red';
+
+  const drivers = parts.filter((p) => p.note).map((p) => p.note!) as string[];
+
+  /* hard overrides — these outrank the arithmetic */
   if (today.illness) {
-    override = 'Illness reported. If there is any systemic symptom — fever, chest involvement, body aches, swollen glands — stop training completely and do not attempt to salvage the week. Above-the-neck only: easy Z1–Z2 at reduced volume, and no quality work until symptom-free for 24 hours.';
-  } else if (today.pain && today.pain.trim()) {
-    override = 'Pain reported. If it changes how you move — gait, stroke or pedal action — that discipline stops today. Three consecutive days in the same place means stop and get it assessed, not wait and see.';
-  } else if (today.sleep_h != null && Number(today.sleep_h) < 5) {
-    override = 'Under five hours of sleep. Any key session moves; it is not attempted today.';
+    band = 'red';
+    score = Math.min(score, 40);
+    drivers.unshift('Unwell. Nothing above the neck rule survives contact with a rebuilt knee and a Wednesday drive — rest.');
   } else {
-    const recentRhr = series(history.slice(0, 2), (r) => r.rhr);
-    const baseRhr = series(base.slice(2), (r) => r.rhr);
-    if (today.rhr != null && recentRhr.length >= 1 && baseRhr.length >= 5) {
-      const m = mean(baseRhr);
-      if (Number(today.rhr) - m >= 7 && recentRhr[0] - m >= 7) {
-        override = 'Resting HR has been more than 7 bpm above baseline for two mornings. Full rest day, regardless of how you feel.';
-      }
+    const rhrBase = mean(past.map((r) => r.rhr ?? NaN));
+    const streak = rhrBase !== null
+      && [today, ...past].slice(0, 3).every((r) => r.rhr !== null && r.rhr - rhrBase >= 7)
+      && past.length >= 5;
+    if (streak) {
+      band = 'red';
+      drivers.unshift('RHR up 7+ bpm three mornings running. That is one of the five pull-back triggers.');
+    } else if (sleepHoursFrom(today) !== null && sleepHoursFrom(today)! < 5.5 && band === 'green') {
+      band = 'amber';
+      drivers.unshift('Under 5.5 h. Keep the session, lose the top set.');
     }
   }
 
-  if (!reasons.length) reasons.push('Everything is sitting at or above your normal.');
+  const headline =
+    band === 'green' ? 'Good to go' : band === 'amber' ? 'Train, but trim it' : 'Back off today';
 
-  return { score, band, reasons, override, consecutiveAmber, consecutiveRed };
+  const action =
+    band === 'green'
+      ? 'Run the session as written. If it is a plyo day, this is the day to progress it.'
+      : band === 'amber'
+        ? 'Keep every movement, cut one set from each and 10% off the bar. Do not touch the plyo progression today.'
+        : 'No plyometrics and no heavy unilateral work. Knee 10, a walk, the sauna, and an early night. Skill work is what you protect last — if it is Wednesday, still go, and ski to feel.';
+
+  return { score, band, headline, drivers, action };
 }

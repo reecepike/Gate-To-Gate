@@ -54,6 +54,21 @@ export type Job = {
   last_touched: string | null;
   created_at: string;
   notes: string | null;
+
+  /* --- added by the performance-OS rebuild. All optional, because every
+         job created before it has none of them. ------------------------ */
+  /** Groups tasks under one piece of work: "Client website". */
+  project?: string | null;
+  /** Subtasks point at their parent. */
+  parent_id?: number | null;
+  /** 'daily' | 'weekly' | 'fortnightly' | 'monthly' — outreach, content, admin. */
+  recurring?: string | null;
+  recur_dow?: number | null;
+  next_due?: string | null;
+  /** Which part of life this belongs to, for the planner and the goals. */
+  area?: 'work' | 'own' | 'brand' | 'ski' | 'life' | 'money';
+  /** The long-term goal this serves, when it serves one. */
+  goal_id?: number | null;
 };
 
 /* ------------------------------------------------------------ capacity */
